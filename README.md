@@ -160,6 +160,7 @@ sdlc-evidence bundle                 # alias of evaluate
 sdlc-evidence controls               # print the active control catalog
 sdlc-evidence compare BEFORE AFTER   # diff two bundles (coverage, status, per-control)
 sdlc-evidence oscal [--output PATH]  # render the control catalog as OSCAL Catalog JSON
+sdlc-evidence oscal --kind assessment-results --bundle BUNDLE  # OSCAL Assessment Results (limits: docs/limitations.md §22)
 sdlc-evidence plugins                # list parser and collector entry-point plugins
 sdlc-evidence schema [--output PATH] # emit JSON Schema for EvidenceBundle
 sdlc-evidence doctor [--json]        # run local environment health checks
@@ -558,7 +559,14 @@ Bundle comparison across runs is available via `sdlc-evidence compare
 before.json after.json`. It reports what changed but never fails a build, and
 no workflow in this repository runs it. What CI does enforce is the
 structural-determinism gate: it rebuilds the sample bundle and compares the
-normalized SHA-256 across runs and operating systems.
+normalized SHA-256 across runs and operating systems. When the two bundles
+were evaluated against different control catalogs (different SHA-256),
+`compare` names both catalogs and marks each control change `(catalog)`, since
+the movement may come from the catalog rather than the evidence. The JSON output
+carries the same facts under `catalog` and `controls.catalog_drift`. If either
+bundle records no catalog (bundles made before catalog provenance was recorded),
+`catalog.changed` is `null` and the table warns that control changes cannot be
+attributed.
 
 ---
 

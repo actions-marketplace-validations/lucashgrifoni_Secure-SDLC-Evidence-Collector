@@ -20,10 +20,16 @@ References
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
+import re
 import uuid
 from collections.abc import Iterable
 from datetime import UTC, datetime
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any
+from urllib.parse import urlsplit
 
 from evidence_collector import __version__
 from evidence_collector.domain.enums import (
@@ -36,12 +42,19 @@ from evidence_collector.domain.models import (
     ControlEvaluation,
     EvidenceBundle,
     EvidenceException,
+    NormalizedEvidence,
+    RawEvidenceRef,
 )
 
 # Stable, project-scoped namespace for synthesizing OSCAL UUIDs from
 # control IDs. Generated once and frozen so the same control_id always
 # maps to the same OSCAL uuid across runs (required for stable diffs).
 _OSCAL_NAMESPACE = uuid.UUID("c5f8d34a-2c4b-4f8c-9e07-21f1f9e2a4c1")
+
+# `ns` for props this project defines that OSCAL does not.
+EVIDENCE_COLLECTOR_OSCAL_NS = (
+    "https://github.com/lucashgrifoni/Secure-SDLC-Evidence-Collector/ns/oscal"
+)
 
 
 def _control_uuid(control_id: str) -> str:
@@ -65,7 +78,7 @@ def _criticality_to_class(criticality: ControlCriticality) -> str:
     return f"criticality-{criticality.value}"
 
 
-def _control_to_oscal(control: ControlDefinition) -> dict[str, Any]:
+def _control_to_oscal(control: ControlDefinition, token: str) -> dict[str, Any]:
     properties = [
         {"name": "control_id", "value": control.control_id},
         {"name": "framework", "value": control.framework.value},
@@ -92,7 +105,7 @@ def _control_to_oscal(control: ControlDefinition) -> dict[str, Any]:
         parts.append({"name": "guidance", "prose": control.rationale_template})
 
     return {
-        "id": control.control_id.lower().replace(".", "-"),
+        "id": token,
         "uuid": _control_uuid(control.control_id),
         "class": _criticality_to_class(control.criticality),
         "title": control.name,
@@ -104,11 +117,12 @@ def _control_to_oscal(control: ControlDefinition) -> dict[str, Any]:
 def export_oscal_catalog(controls: Iterable[ControlDefinition]) -> dict[str, Any]:
     """Render the catalog as a single OSCAL Catalog JSON document."""
     controls_list = list(controls)
+    tokens = _control_tokens(c.control_id for c in controls_list)
 
     grouped: dict[str, list[dict[str, Any]]] = {}
     for control in controls_list:
         grouped.setdefault(_group_for_framework(control.framework), []).append(
-            _control_to_oscal(control)
+            _control_to_oscal(control, tokens[control.control_id])
         )
 
     groups = [
@@ -121,9 +135,9 @@ def export_oscal_catalog(controls: Iterable[ControlDefinition]) -> dict[str, Any
     ]
 
     catalog_uuid = str(uuid.uuid5(_OSCAL_NAMESPACE, "catalog:secure-sdlc-evidence-collector"))
-    last_modified = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%S.000+00:00")
+    last_modified = _oscal_datetime(datetime.now(tz=UTC))
 
-    return {
+    document: dict[str, Any] = {
         "catalog": {
             "uuid": catalog_uuid,
             "metadata": {
@@ -141,6 +155,8 @@ def export_oscal_catalog(controls: Iterable[ControlDefinition]) -> dict[str, Any
             "groups": groups,
         }
     }
+    finalized: dict[str, Any] = _finalize(document)
+    return finalized
 
 
 # ---------------------------------------------------------------------------
@@ -176,45 +192,188 @@ _NOT_SATISFIED_REASON: dict[ControlEvaluationStatus, str] = {
 }
 
 _OSCAL_DATETIME = "%Y-%m-%dT%H:%M:%S.000+00:00"
+# A complete SHA-256 hex digest; anything else is left out of rlink hashes.
+_SHA256 = re.compile(r"[0-9A-Fa-f]{64}")
+# Characters RFC 3986 allows in a URI, with every "%" starting a two-digit hex
+# escape (RFC 3986 section 2.1); an artifact_uri with anything else (a space,
+# a raw newline, "%zz") is not linked.
+_URI_CHARS = re.compile(r"(?:[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=]|%[0-9A-Fa-f]{2})+")
 
 
-def _evaluation_uuid(release_id: str, control_id: str) -> str:
-    """Stable UUIDv5 for an (release_id, control_id) finding."""
-    return str(uuid.uuid5(_OSCAL_NAMESPACE, f"eval:{release_id}:{control_id}"))
+def _oscal_datetime(value: datetime) -> str:
+    """Format ``value`` in UTC, converting rather than relabelling.
+
+    An aware value used to be formatted with a hard-coded ``+00:00`` whatever
+    its offset, so 18:30 at +05:30 was published as 18:30 UTC. A naive value
+    is read as UTC, the convention the rest of the collector uses.
+    """
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).strftime(_OSCAL_DATETIME)
 
 
-def _observation_uuid(release_id: str, control_id: str) -> str:
+def _is_ncname(value: str) -> bool:
+    return (
+        bool(value)
+        and (value[0].isalpha() or value[0] == "_")
+        and all(ch.isalnum() or ch in ".-_" for ch in value)
+    )
+
+
+def _short_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+
+
+def _control_tokens(control_ids: Iterable[str]) -> dict[str, str]:
+    """Map each control id to the NCName token OSCAL uses for it.
+
+    The token was the id lower-cased with dots replaced, which is valid for the
+    shipped catalogs (``SSDF-PS.3`` -> ``ssdf-ps-3``) and is kept for them. A
+    custom catalog may use ``1``, ``ORG:BUILD`` or ``custom control``; those
+    are sanitized and given a short hash of the original id, so two ids that
+    sanitize alike stay apart. Ids whose tokens still collide (``ORG.BUILD``
+    and ``ORG-BUILD``) all get the hash suffix.
+    """
+    ids = list(dict.fromkeys(control_ids))
+    base: dict[str, str] = {}
+    for control_id in ids:
+        token = control_id.lower().replace(".", "-")
+        if not _is_ncname(token):
+            cleaned = "".join(ch if ch.isalnum() or ch in ".-_" else "-" for ch in token)
+            if not cleaned or not (cleaned[0].isalpha() or cleaned[0] == "_"):
+                cleaned = f"control-{cleaned}"
+            token = f"{cleaned}-{_short_hash(control_id)}"
+        base[control_id] = token
+    seen: dict[str, int] = {}
+    for token in base.values():
+        seen[token] = seen.get(token, 0) + 1
+    return {
+        control_id: token if seen[token] == 1 else f"{token}-{_short_hash(control_id)}"
+        for control_id, token in base.items()
+    }
+
+
+def _prop_value(value: object) -> str:
+    """A prop value as OSCAL's StringDatatype allows: no edge or inner line breaks."""
+    return " ".join(str(value).split())
+
+
+def _finalize(node: Any) -> Any:
+    """Make a document satisfy OSCAL's array and string rules, whatever the input.
+
+    Every OSCAL JSON array has ``minItems: 1`` and every prop value is a
+    StringDatatype (no leading or trailing whitespace, no line break). Values
+    come from operator-supplied bundles and catalogs, so instead of guarding
+    each call site this pass collapses whitespace in prop values and media
+    types, drops props and media types that end up empty, and removes any key
+    whose list is empty (``observations`` and ``findings`` for a bundle with no
+    evaluations, ``risks``, ``props``, ``include-controls``).
+    """
+    if isinstance(node, list):
+        return [_finalize(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    out: dict[str, Any] = {}
+    for key, value in node.items():
+        if key == "props" and isinstance(value, list):
+            value = [
+                {**prop, "value": _prop_value(prop.get("value", ""))}
+                for prop in value
+                if isinstance(prop, dict) and _prop_value(prop.get("value", ""))
+            ]
+        elif key == "media-type" and isinstance(value, str):
+            value = _prop_value(value)
+            if not value:
+                continue
+        value = _finalize(value)
+        if isinstance(value, list) and not value:
+            continue
+        out[key] = value
+    return out
+
+
+def _assessment_scope(bundle: EvidenceBundle) -> str:
+    """The subject every per-release uuid is scoped to.
+
+    OSCAL finding, observation and result uuids are globally unique and
+    assigned per subject. Two applications cut on the same release id (a
+    calendar tag such as ``2026.04.10`` is common across an org) are two
+    subjects, so the application name, its repository and the release id all
+    seed the uuid, and so does the environment: the same release assessed in
+    staging and in production is two subjects. JSON keeps the parts
+    unambiguous whatever they contain.
+    """
+    return json.dumps(
+        [
+            bundle.application.name,
+            bundle.application.repository,
+            bundle.application.environment,
+            bundle.release.release_id,
+            bundle.release.commit_sha,
+        ],
+        ensure_ascii=False,
+    )
+
+
+def _scoped_uuid(kind: str, scope: str, *parts: str) -> str:
+    return str(uuid.uuid5(_OSCAL_NAMESPACE, ":".join((kind, scope, *parts))))
+
+
+def _evaluation_uuid(scope: str, control_id: str) -> str:
+    """Stable UUIDv5 for the finding of one control in one subject's release."""
+    return _scoped_uuid("eval", scope, control_id)
+
+
+def _observation_uuid(scope: str, control_id: str) -> str:
     """Stable UUIDv5 for the observation that backs a finding."""
-    return str(uuid.uuid5(_OSCAL_NAMESPACE, f"obs:{release_id}:{control_id}"))
+    return _scoped_uuid("obs", scope, control_id)
 
 
-def _risk_uuid(release_id: str, control_id: str) -> str:
+def _risk_uuid(scope: str, control_id: str) -> str:
     """Stable UUIDv5 for the approved-deviation risk of a waived control."""
-    return str(uuid.uuid5(_OSCAL_NAMESPACE, f"risk:{release_id}:{control_id}"))
+    return _scoped_uuid("risk", scope, control_id)
 
 
-def _result_uuid(release_id: str) -> str:
+def _evidence_resource_uuid(scope: str, evidence_id: str) -> str:
+    """Stable UUIDv5 for the back-matter resource describing one evidence item."""
+    return _scoped_uuid("evidence", scope, evidence_id)
+
+
+def _assessment_plan_resource_uuid(scope: str) -> str:
+    """Stable UUIDv5 for the back-matter resource ``import-ap`` points at."""
+    return _scoped_uuid("ap", scope)
+
+
+def _assessment_plan_uuid(scope: str) -> str:
+    """Stable UUIDv5 for the embedded assessment-plan document itself."""
+    return _scoped_uuid("ap-document", scope)
+
+
+def _ssp_placeholder_uuid(scope: str) -> str:
+    """Stable UUIDv5 for the resource the embedded plan's ``import-ssp`` names."""
+    return _scoped_uuid("ssp", scope)
+
+
+def _result_uuid(scope: str) -> str:
     """Stable UUIDv5 for the single assessment result this AR carries."""
-    return str(uuid.uuid5(_OSCAL_NAMESPACE, f"result:{release_id}"))
+    return _scoped_uuid("result", scope)
 
 
-def _ar_uuid(release_id: str, commit_sha: str) -> str:
+def _ar_uuid(scope: str, commit_sha: str) -> str:
     """Stable UUIDv5 for the top-level assessment-results document."""
-    return str(uuid.uuid5(_OSCAL_NAMESPACE, f"ar:{release_id}:{commit_sha}"))
-
-
-def _control_target_id(control_id: str) -> str:
-    """OSCAL control id, kebab-case, lower."""
-    return control_id.lower().replace(".", "-")
+    return _scoped_uuid("ar", scope, commit_sha)
 
 
 def _evaluation_to_observation(
     evaluation: ControlEvaluation,
-    release_id: str,
+    scope: str,
     collected_iso: str,
 ) -> dict[str, Any]:
-    return {
-        "uuid": _observation_uuid(release_id, evaluation.control_id),
+    # Each evidence ref links to a back-matter resource in this document. The
+    # refs used to be hashed into `subjects[].subject-uuid` values that matched
+    # nothing, so the evidence behind a finding could not be recovered.
+    observation: dict[str, Any] = {
+        "uuid": _observation_uuid(scope, evaluation.control_id),
         "title": f"Evidence for {evaluation.control_id}",
         "description": evaluation.rationale,
         "methods": ["EXAMINE"],
@@ -227,16 +386,24 @@ def _evaluation_to_observation(
             {"name": "evaluation_status", "value": evaluation.evaluation_status.value},
             {"name": "confidence", "value": evaluation.confidence.value},
         ],
-        "subjects": [
-            {"subject-uuid": _observation_uuid(release_id, ref), "type": "evidence"}
-            for ref in evaluation.evidence_refs
-        ],
     }
+    # OSCAL requires relevant-evidence to be non-empty when present, and a
+    # control with no evidence at all (the usual not_ready case) has none.
+    if evaluation.evidence_refs:
+        observation["relevant-evidence"] = [
+            {
+                "href": f"#{_evidence_resource_uuid(scope, ref)}",
+                "description": f"Evidence item {ref}",
+            }
+            for ref in evaluation.evidence_refs
+        ]
+    return observation
 
 
 def _evaluation_to_finding(
     evaluation: ControlEvaluation,
-    release_id: str,
+    scope: str,
+    tokens: dict[str, str],
 ) -> dict[str, Any]:
     state = _OSCAL_TARGET_STATE.get(evaluation.evaluation_status, "not-satisfied")
     props = [
@@ -249,27 +416,27 @@ def _evaluation_to_finding(
         props.append({"name": "not_satisfied_reason", "value": reason})
     props.extend({"name": "exception_id", "value": ref} for ref in evaluation.exception_refs)
     finding: dict[str, Any] = {
-        "uuid": _evaluation_uuid(release_id, evaluation.control_id),
+        "uuid": _evaluation_uuid(scope, evaluation.control_id),
         "title": evaluation.control_name,
         "description": evaluation.rationale,
         "target": {
             "type": "objective-id",
-            "target-id": _control_target_id(evaluation.control_id),
+            "target-id": tokens[evaluation.control_id],
             "status": {"state": state},
         },
         "related-observations": [
-            {"observation-uuid": _observation_uuid(release_id, evaluation.control_id)}
+            {"observation-uuid": _observation_uuid(scope, evaluation.control_id)}
         ],
         "props": props,
     }
     if evaluation.evaluation_status is ControlEvaluationStatus.WAIVED:
-        finding["related-risks"] = [{"risk-uuid": _risk_uuid(release_id, evaluation.control_id)}]
+        finding["related-risks"] = [{"risk-uuid": _risk_uuid(scope, evaluation.control_id)}]
     return finding
 
 
 def _waiver_to_risk(
     evaluation: ControlEvaluation,
-    release_id: str,
+    scope: str,
     exceptions: dict[str, EvidenceException],
 ) -> dict[str, Any]:
     """Record a waived control as an OSCAL risk with an approved deviation.
@@ -284,7 +451,7 @@ def _waiver_to_risk(
     props.extend({"name": "approver", "value": w.approver} for w in waivers)
     props.extend({"name": "reference", "value": w.reference} for w in waivers if w.reference)
     risk: dict[str, Any] = {
-        "uuid": _risk_uuid(release_id, evaluation.control_id),
+        "uuid": _risk_uuid(scope, evaluation.control_id),
         "title": f"Approved deviation for {evaluation.control_id}",
         "description": " ".join(w.justification for w in waivers) or f"Control waived by {ids}.",
         "statement": (
@@ -295,8 +462,11 @@ def _waiver_to_risk(
         "props": props,
     }
     if waivers:
-        earliest = min(w.expires_at for w in waivers).astimezone(UTC)
-        risk["deadline"] = earliest.strftime(_OSCAL_DATETIME)
+        earliest = min(
+            w.expires_at if w.expires_at.tzinfo else w.expires_at.replace(tzinfo=UTC)
+            for w in waivers
+        )
+        risk["deadline"] = _oscal_datetime(earliest)
     return risk
 
 
@@ -311,25 +481,24 @@ def export_oscal_assessment_results(bundle: EvidenceBundle) -> dict[str, Any]:
     """
     release_id = bundle.release.release_id
     commit_sha = bundle.release.commit_sha
-    collected_iso = (bundle.generated_at or datetime.now(tz=UTC)).strftime(
-        "%Y-%m-%dT%H:%M:%S.000+00:00"
-    )
+    scope = _assessment_scope(bundle)
+    collected_iso = _oscal_datetime(bundle.generated_at or datetime.now(tz=UTC))
+    tokens = _control_tokens(ev.control_id for ev in bundle.control_evaluations)
 
     observations = [
-        _evaluation_to_observation(ev, release_id, collected_iso)
-        for ev in bundle.control_evaluations
+        _evaluation_to_observation(ev, scope, collected_iso) for ev in bundle.control_evaluations
     ]
-    findings = [_evaluation_to_finding(ev, release_id) for ev in bundle.control_evaluations]
+    findings = [_evaluation_to_finding(ev, scope, tokens) for ev in bundle.control_evaluations]
     exceptions = {exc.exception_id: exc for exc in bundle.exceptions}
     risks = [
-        _waiver_to_risk(ev, release_id, exceptions)
+        _waiver_to_risk(ev, scope, exceptions)
         for ev in bundle.control_evaluations
         if ev.evaluation_status is ControlEvaluationStatus.WAIVED
     ]
 
     document: dict[str, Any] = {
         "assessment-results": {
-            "uuid": _ar_uuid(release_id, commit_sha),
+            "uuid": _ar_uuid(scope, commit_sha),
             "metadata": {
                 "title": (f"Assessment Results · {bundle.application.name} · release {release_id}"),
                 "last-modified": collected_iso,
@@ -339,16 +508,17 @@ def export_oscal_assessment_results(bundle: EvidenceBundle) -> dict[str, Any]:
                     {"name": "source", "value": "secure-sdlc-evidence-collector"},
                     {"name": "release_id", "value": release_id},
                     {"name": "commit_sha", "value": commit_sha},
+                    {"name": "environment", "value": bundle.application.environment},
                     {
                         "name": "release_status",
                         "value": bundle.summary.release_status.value,
                     },
                 ],
             },
-            "import-ap": {"href": "#sdlc-evidence-assessment-plan"},
+            "import-ap": {"href": f"#{_assessment_plan_resource_uuid(scope)}"},
             "results": [
                 {
-                    "uuid": _result_uuid(release_id),
+                    "uuid": _result_uuid(scope),
                     "title": f"Release {release_id}",
                     "description": (
                         f"Secure SDLC evidence evaluation for "
@@ -357,17 +527,9 @@ def export_oscal_assessment_results(bundle: EvidenceBundle) -> dict[str, Any]:
                     ),
                     "start": collected_iso,
                     "end": collected_iso,
-                    "reviewed-controls": {
-                        "control-selections": [
-                            {
-                                "description": "Controls evaluated by this assessment",
-                                "include-controls": [
-                                    {"control-id": _control_target_id(ev.control_id)}
-                                    for ev in bundle.control_evaluations
-                                ],
-                            }
-                        ],
-                    },
+                    "reviewed-controls": _reviewed_controls(
+                        bundle, "Controls evaluated by this assessment", tokens
+                    ),
                     "observations": observations,
                     "findings": findings,
                 }
@@ -376,4 +538,230 @@ def export_oscal_assessment_results(bundle: EvidenceBundle) -> dict[str, Any]:
     }
     if risks:
         document["assessment-results"]["results"][0]["risks"] = risks
-    return document
+    document["assessment-results"]["back-matter"] = {
+        "resources": [
+            _assessment_plan_resource(bundle, scope, collected_iso),
+            *_evidence_resources(bundle, scope),
+        ]
+    }
+    finalized: dict[str, Any] = _finalize(document)
+    return finalized
+
+
+def _reviewed_controls(
+    bundle: EvidenceBundle, description: str, tokens: dict[str, str]
+) -> dict[str, Any]:
+    return {
+        "control-selections": [
+            {
+                "description": description,
+                "include-controls": [
+                    {"control-id": tokens[ev.control_id]} for ev in bundle.control_evaluations
+                ],
+            }
+        ],
+    }
+
+
+def _catalog_props(bundle: EvidenceBundle) -> list[dict[str, str]]:
+    if bundle.catalog is None:
+        return []
+    return [
+        {"name": "catalog_origin", "value": bundle.catalog.origin},
+        {"name": "catalog_name", "value": bundle.catalog.name},
+        {"name": "catalog_sha256", "value": bundle.catalog.sha256},
+    ]
+
+
+def _assessment_plan(bundle: EvidenceBundle, scope: str, last_modified: str) -> dict[str, Any]:
+    """A minimal OSCAL 1.1.2 assessment-plan generated from the same bundle.
+
+    It carries the fields the AP model requires (uuid, metadata, import-ssp,
+    reviewed-controls): the plan was to evaluate these controls against the
+    catalog recorded in the bundle. The collector has no system security plan,
+    so ``import-ssp`` resolves to a back-matter resource inside the plan that
+    says so and names the application and repository assessed.
+    """
+    tokens = _control_tokens(ev.control_id for ev in bundle.control_evaluations)
+    metadata: dict[str, Any] = {
+        "title": (
+            f"Assessment Plan · {bundle.application.name} · release {bundle.release.release_id}"
+        ),
+        "last-modified": last_modified,
+        "version": __version__,
+        "oscal-version": "1.1.2",
+    }
+    metadata["props"] = [
+        {"name": "environment", "value": bundle.application.environment},
+        *_catalog_props(bundle),
+    ]
+    no_ssp = (
+        "No OSCAL system security plan is published. The system assessed is "
+        f"{bundle.application.name} ({bundle.application.repository})."
+    )
+    return {
+        "assessment-plan": {
+            "uuid": _assessment_plan_uuid(scope),
+            "metadata": metadata,
+            "import-ssp": {"href": f"#{_ssp_placeholder_uuid(scope)}"},
+            "reviewed-controls": _reviewed_controls(
+                bundle, "Controls the release is evaluated against", tokens
+            ),
+            "back-matter": {
+                "resources": [
+                    {
+                        "uuid": _ssp_placeholder_uuid(scope),
+                        "title": "System under assessment",
+                        "description": no_ssp,
+                        # A resource needs an rlink or base64; the statement is
+                        # the content, since there is no SSP to link to.
+                        "base64": _base64_payload("no-ssp.txt", "text/plain", no_ssp),
+                    }
+                ]
+            },
+        }
+    }
+
+
+def _assessment_plan_resource(
+    bundle: EvidenceBundle, scope: str, last_modified: str
+) -> dict[str, Any]:
+    """The back-matter resource ``import-ap`` resolves to.
+
+    OSCAL requires ``import-ap``, and the collector publishes no separate plan
+    file, so the plan is generated from the bundle and embedded here as base64.
+    It first pointed at a fragment the document never defined, then at a
+    resource holding only a title and a description, which resolved but was
+    not an assessment plan.
+    """
+    plan = json.dumps(
+        _finalize(_assessment_plan(bundle, scope, last_modified)),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    resource: dict[str, Any] = {
+        "uuid": _assessment_plan_resource_uuid(scope),
+        "title": "Assessment plan",
+        "description": (
+            "OSCAL assessment-plan generated from the evidence bundle: the controls "
+            "evaluated and the catalog they were evaluated against."
+        ),
+        "base64": _base64_payload("assessment-plan.json", "application/oscal+json", plan),
+    }
+    props = _catalog_props(bundle)
+    if props:
+        resource["props"] = props
+    return resource
+
+
+def _base64_payload(filename: str, media_type: str, text: str) -> dict[str, str]:
+    return {
+        "filename": filename,
+        "media-type": media_type,
+        "value": base64.b64encode(text.encode("utf-8")).decode("ascii"),
+    }
+
+
+def _absolute_artifact_href(raw: RawEvidenceRef) -> str | None:
+    r"""A link to where the artifact is, when that location is absolute.
+
+    A relative ``artifact_path`` is relative to the collection root, but OSCAL
+    resolves a relative rlink against the AR document itself, so linking it
+    would point somewhere else. Only an absolute URI, or an absolute Windows
+    or POSIX path (as a ``file:`` URI), is linked. A drive-relative Windows
+    path such as ``C:reports\\scan.json`` has a drive but no root: it is not
+    absolute, and ``as_uri()`` raises on it.
+    """
+    if raw.artifact_uri and _URI_CHARS.fullmatch(raw.artifact_uri):
+        # urlsplit raises ValueError on input such as ``http://[``; a URI it
+        # cannot parse is not linked, and the record is embedded instead.
+        # Reading ``.port`` also rejects a non-numeric or out-of-range port.
+        try:
+            parts = urlsplit(raw.artifact_uri)
+            _ = parts.port
+            scheme = parts.scheme
+        except ValueError:
+            scheme = ""
+        if scheme:
+            return raw.artifact_uri
+    path = raw.artifact_path
+    if not path:
+        return None
+    windows = PureWindowsPath(path)
+    if windows.drive and windows.is_absolute():
+        return windows.as_uri()
+    if path.startswith("/"):
+        return PurePosixPath(path).as_uri()
+    return None
+
+
+def _ncname_filename(evidence_id: str) -> str:
+    """A base64 ``filename`` that is a valid NCName whatever the evidence id."""
+    return "evidence-" + re.sub(r"[^A-Za-z0-9._-]", "_", evidence_id) + ".json"
+
+
+def _evidence_content(item: NormalizedEvidence | None, evidence_id: str) -> dict[str, Any]:
+    """The rlink or base64 an OSCAL 1.1.2 back-matter resource must carry.
+
+    A link to the artifact when its location is absolute; otherwise the
+    normalized evidence record itself, so the resource still holds what the
+    finding relied on, with a relative path recorded as a prop.
+    """
+    raw = item.raw if item is not None else None
+    href = _absolute_artifact_href(raw) if raw is not None else None
+    if raw is not None and href is not None:
+        rlink: dict[str, Any] = {"href": href}
+        if raw.content_type:
+            rlink["media-type"] = raw.content_type
+        digest = (raw.integrity_hash or "").removeprefix("sha256:")
+        if (
+            raw.integrity_hash
+            and raw.integrity_hash.startswith("sha256:")
+            and _SHA256.fullmatch(digest)
+        ):
+            rlink["hashes"] = [{"algorithm": "SHA-256", "value": digest}]
+        return {"rlinks": [rlink]}
+    record = (
+        item.model_dump_json()
+        if item is not None
+        else json.dumps({"evidence_id": evidence_id, "present_in_bundle": False})
+    )
+    content: dict[str, Any] = {
+        "base64": _base64_payload(_ncname_filename(evidence_id), "application/json", record)
+    }
+    location = (raw.artifact_path or raw.artifact_uri) if raw is not None else None
+    if location:
+        content["props"] = [
+            {"name": "artifact-path", "ns": EVIDENCE_COLLECTOR_OSCAL_NS, "value": location}
+        ]
+    return content
+
+
+def _evidence_resources(bundle: EvidenceBundle, scope: str) -> list[dict[str, Any]]:
+    """One back-matter resource per evidence id any observation links to."""
+    by_id = {item.evidence_id: item for item in bundle.evidence}
+    referenced = sorted({ref for ev in bundle.control_evaluations for ref in ev.evidence_refs})
+    resources: list[dict[str, Any]] = []
+    for evidence_id in referenced:
+        props = [{"name": "evidence_id", "value": evidence_id}]
+        item = by_id.get(evidence_id)
+        if item is None:
+            description = "Evidence item named by an evaluation but absent from the bundle."
+        else:
+            description = f"{item.evidence_type.value} evidence produced by {item.producer}."
+            props.append({"name": "evidence_type", "value": item.evidence_type.value})
+            props.append({"name": "evidence_status", "value": item.status.value})
+            if item.raw is not None and item.raw.integrity_hash:
+                props.append({"name": "integrity_hash", "value": item.raw.integrity_hash})
+        content = _evidence_content(item, evidence_id)
+        resources.append(
+            {
+                "uuid": _evidence_resource_uuid(scope, evidence_id),
+                "title": evidence_id,
+                "description": description,
+                "props": props + content.pop("props", []),
+                **content,
+            }
+        )
+    return resources
