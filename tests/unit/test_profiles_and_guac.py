@@ -207,3 +207,74 @@ def test_guac_adapter_falls_back_to_evidence_for_unknown_type() -> None:
     bundle = _bundle([_evidence(evidence_type=EvidenceType.RELEASE_APPROVAL)])
     doc = build_guac_collection(bundle)
     assert doc["documents"][0]["type"] == "evidence"
+
+
+def test_cra_profile_reports_kev_cve_that_has_no_epss_record() -> None:
+    """A KEV CVE without an EPSS score never reaches top_risk_cves (D07)."""
+    evidence = _evidence()
+    assert evidence.vulnerability_intelligence is not None
+    intel = evidence.vulnerability_intelligence.model_copy(
+        update={"cves_in_kev_count": 1, "cves_known_ransomware_count": 1, "top_risk_cves": []}
+    )
+    bundle = _bundle([evidence.model_copy(update={"vulnerability_intelligence": intel})])
+    annotated = apply_profile(bundle, ReleaseProfile.CRA_2026)
+    assert annotated.evidence[0].metadata["cra"]["global_exploitation_signal"] == "kev_listed"
+
+
+def test_refresh_cra_signal_updates_only_cra_annotated_records() -> None:
+    from evidence_collector.application.profiles import refresh_cra_exploitation_signals
+
+    annotated = apply_profile(_bundle([_evidence(in_kev=True)]), ReleaseProfile.CRA_2026)
+    stale_meta = dict(annotated.evidence[0].metadata)
+    stale_meta["cra"] = {**stale_meta["cra"], "global_exploitation_signal": "unavailable"}
+    stale = annotated.model_copy(
+        update={"evidence": [annotated.evidence[0].model_copy(update={"metadata": stale_meta})]}
+    )
+    refreshed = refresh_cra_exploitation_signals(stale)
+    assert refreshed.evidence[0].metadata["cra"]["global_exploitation_signal"] == "kev_listed"
+    # The input is not mutated.
+    assert stale.evidence[0].metadata["cra"]["global_exploitation_signal"] == "unavailable"
+    # A bundle without the CRA profile is returned as-is.
+    plain = _bundle([_evidence(in_kev=True)])
+    assert refresh_cra_exploitation_signals(plain) is plain
+
+
+def _intel_variant(**update: object) -> NormalizedEvidence:
+    evidence = _evidence(epss_percentile=0.1)
+    assert evidence.vulnerability_intelligence is not None
+    return evidence.model_copy(
+        update={
+            "vulnerability_intelligence": evidence.vulnerability_intelligence.model_copy(
+                update=update
+            )
+        }
+    )
+
+
+def test_cra_signal_is_unavailable_when_kev_was_not_consulted_and_epss_is_low() -> None:
+    bundle = _bundle([_intel_variant(kev_consulted=False)])
+    annotated = apply_profile(bundle, ReleaseProfile.CRA_2026)
+    assert annotated.evidence[0].metadata["cra"]["global_exploitation_signal"] == "unavailable"
+
+
+def test_cra_signal_is_unavailable_when_epss_was_not_consulted_and_kev_has_no_match() -> None:
+    bundle = _bundle(
+        [_intel_variant(epss_consulted=False, top_risk_cves=[], max_epss_percentile=None)]
+    )
+    annotated = apply_profile(bundle, ReleaseProfile.CRA_2026)
+    assert annotated.evidence[0].metadata["cra"]["global_exploitation_signal"] == "unavailable"
+
+
+def test_cra_signal_still_reports_a_positive_kev_when_epss_was_not_consulted() -> None:
+    bundle = _bundle(
+        [
+            _intel_variant(
+                epss_consulted=False,
+                top_risk_cves=[],
+                cves_in_kev_count=1,
+                max_epss_percentile=None,
+            )
+        ]
+    )
+    annotated = apply_profile(bundle, ReleaseProfile.CRA_2026)
+    assert annotated.evidence[0].metadata["cra"]["global_exploitation_signal"] == "kev_listed"
