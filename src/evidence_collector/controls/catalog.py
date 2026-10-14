@@ -43,12 +43,22 @@ def _coerce_path(path: str | Path) -> Path:
     catalog-ai.yaml` raised FileNotFoundError, and the only documented way in
     was an `importlib.resources` incantation that breaks under pipx, Windows
     and containers where the interpreter is `python3`. The filesystem is still
-    consulted first, so a local file of the same name always wins.
+    consulted first for the name exactly as given; a bare name that resolves to
+    a bundled catalog warns when a file of the resolved name sits in the working
+    directory.
     """
     candidate = Path(path).expanduser()
     if candidate.is_file():
         return candidate
     name = candidate.name
+    if not name:
+        # `--catalog ""` or `--catalog .` named no file at all; refuse it
+        # clearly instead of failing deep in the bundled-name lookup.
+        available = ", ".join(bundled_catalog_names())
+        raise FileNotFoundError(
+            f"Control catalog path {str(path)!r} names no file. "
+            f"Bundled catalogs available by name: {available}"
+        )
     if candidate == Path(name):
         # `--help` promises "the bare name of a bundled catalog", but only the
         # `.yaml` spelling resolved: `--catalog catalog-ssdf-1.2` was refused.
@@ -71,17 +81,18 @@ def _coerce_path(path: str | Path) -> Path:
             # a local file the user meant, so only a file-like name warns.
             # Decided on the text as given: Path drops a leading `./`, which
             # is exactly the syntax of someone pointing at their own file.
-            if spelling != name and str(path) == name:
+            # A file of the resolved name in the working directory may be the
+            # user's own catalog, so that case keeps the warning too.
+            if spelling != name and str(path) == name and not Path(spelling).exists():
                 return resolved
             logger.warning(
                 "Control catalog %r was not found on disk; falling back to the "
                 "BUNDLED catalog of the same name (%s). The verdict will be "
                 "computed against the bundled control set, not yours. Pass an "
-                "explicit path (./%s) if you meant a local file, or the name without "
-                "the extension to select the bundled catalog without this warning.",
+                "explicit path (./%s) if you meant a local file.",
                 str(path),
                 resolved,
-                name,
+                spelling,
             )
             return resolved
     available = ", ".join(bundled_catalog_names())
