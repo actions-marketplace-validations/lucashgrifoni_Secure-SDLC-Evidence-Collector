@@ -134,9 +134,11 @@ def _run_args(output_dir: Path, *extra: str) -> list[str]:
     ]
 
 
-def test_missing_input_directories_are_reported_not_fatal(
+def test_run_exits_input_error_when_no_input_directory_exists(
     runner: CliRunner, tmp_path: Path
 ) -> None:
+    # Every directory passed is missing, so nothing could be read: that is an
+    # input error (3), not a not_ready verdict, and no bundle is written.
     missing_artifacts = tmp_path / "nope" / "a"
     missing_attestations = tmp_path / "nope" / "b"
     out = tmp_path / "out"
@@ -151,13 +153,35 @@ def test_missing_input_directories_are_reported_not_fatal(
         ),
     )
 
-    # No evidence was found, so the verdict is not_ready: exit 2, not 3.
-    assert result.exit_code == 2, result.output
+    assert result.exit_code == EXIT_INPUT_ERROR, result.output
+    assert not (out / "bundle.json").exists()
+    assert "none of the input directories exist" in result.output
+    assert str(missing_artifacts) in result.output
+
+
+def test_a_partly_missing_input_set_stays_a_collection_error(
+    runner: CliRunner, tmp_path: Path, sample_release_root: Path
+) -> None:
+    # One readable directory is enough to evaluate: the missing one is
+    # recorded and the exit code is the verdict.
+    out = tmp_path / "out"
+    result = runner.invoke(
+        app,
+        _run_args(
+            out,
+            "--artifacts-dir",
+            str(sample_release_root / "artifacts"),
+            "--attestations-dir",
+            str(tmp_path / "missing-attestations"),
+        ),
+    )
+
     bundle = json.loads((out / "bundle.json").read_text(encoding="utf-8"))
-    assert bundle["summary"]["release_status"] == "not_ready"
+    status = ReleaseStatus(bundle["summary"]["release_status"])
+    assert result.exit_code == exit_code_for_status(status), result.output
+    assert result.exit_code != EXIT_INPUT_ERROR
     errors = {(Path(e["path"]).name, e["reason"]) for e in bundle["collection_errors"]}
-    assert errors == {("a", "directory not found"), ("b", "directory not found")}
-    assert "Collection warnings" in result.output
+    assert ("missing-attestations", "directory not found") in errors
 
 
 def test_missing_exceptions_dir_keeps_the_verdict_of_the_evidence(
@@ -182,3 +206,42 @@ def test_missing_exceptions_dir_keeps_the_verdict_of_the_evidence(
     assert result.exit_code == exit_code_for_status(status), result.output
     assert result.exit_code != EXIT_INPUT_ERROR
     assert [Path(e["path"]).name for e in bundle["collection_errors"]] == ["missing-waivers"]
+
+
+def test_files_passed_as_input_directories_stay_collection_errors(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    # A shell glob can pass files where directories were expected. They exist,
+    # so this is not the "nothing to read" case: the bundle is still written.
+    stray = tmp_path / "scan.sarif"
+    stray.write_text("{}", encoding="utf-8")
+    out = tmp_path / "out"
+    result = runner.invoke(app, _run_args(out, "--artifacts-dir", str(stray)))
+
+    assert result.exit_code != EXIT_INPUT_ERROR, result.output
+    bundle = json.loads((out / "bundle.json").read_text(encoding="utf-8"))
+    assert [Path(e["path"]).name for e in bundle["collection_errors"]] == ["scan.sarif"]
+
+
+def test_the_no_input_error_lists_paths_relative_to_artifact_root(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    # The error goes to CI logs: an absolute workspace path must not leak when
+    # --artifact-root was set to avoid exactly that.
+    root = tmp_path / "clientA-private-workspace"
+    root.mkdir()
+    out = tmp_path / "out"
+    result = runner.invoke(
+        app,
+        _run_args(
+            out,
+            "--artifacts-dir",
+            str(root / "artifacts"),
+            "--artifact-root",
+            str(root),
+        ),
+    )
+
+    assert result.exit_code == EXIT_INPUT_ERROR, result.output
+    assert "clientA-private-workspace" not in result.output
+    assert "artifacts" in result.output
