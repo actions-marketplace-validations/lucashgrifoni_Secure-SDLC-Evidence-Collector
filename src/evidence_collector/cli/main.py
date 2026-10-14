@@ -14,20 +14,27 @@ are re-exported here so the previous import surface is preserved.
 
 from __future__ import annotations
 
-import contextlib
 import sys
 from datetime import UTC, datetime
 from typing import Annotated
 
-import typer
-
 from evidence_collector import __version__
-from evidence_collector.cli._errors import error_console, report_error
-from evidence_collector.cli._exit_codes import EXIT_INPUT_ERROR
-from evidence_collector.cli._logging import configure_logging, emit_event
-from evidence_collector.cli._state import console, is_json_logs, set_json_logs
-from evidence_collector.cli.commands import register_all
-from evidence_collector.cli.commands.doctor import doctor_checks as _doctor_checks
+from evidence_collector.cli._preflight import exit_on_missing_dependency, force_utf8_std_streams
+
+# A missing third-party dependency fails right here, before any command can
+# run. The guard turns that into one actionable line (exit 3) - or, for
+# `doctor`, into its normal check table with the failed `Import:` row (exit 1) -
+# instead of a raw traceback. It covers both the `sdlc-evidence` console script
+# and `python -m evidence_collector.cli.main`, since both import this module.
+with exit_on_missing_dependency():
+    import typer
+
+    from evidence_collector.cli._errors import error_console, report_error
+    from evidence_collector.cli._exit_codes import EXIT_INPUT_ERROR
+    from evidence_collector.cli._logging import configure_logging, emit_event
+    from evidence_collector.cli._state import console, is_json_logs, set_json_logs
+    from evidence_collector.cli.commands import register_all
+    from evidence_collector.cli.commands.doctor import doctor_checks as _doctor_checks
 
 __all__ = ["_doctor_checks", "app", "main"]
 
@@ -71,18 +78,6 @@ def main_callback(
     if ctx.invoked_subcommand is None:
         typer.echo(ctx.get_help())
         raise typer.Exit(code=0)
-
-
-def _force_utf8_std_streams() -> None:
-    # Windows terminals default to cp1252 and crash on Rich's Unicode
-    # separators (→, ⬆). Reconfigure both streams to UTF-8 so the CLI
-    # works out-of-the-box without requiring PYTHONIOENCODING=utf-8.
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is None:
-            continue
-        with contextlib.suppress(OSError, ValueError):
-            reconfigure(encoding="utf-8", errors="replace")
 
 
 # A command that could not run at all exits EXIT_INPUT_ERROR (3), deliberately
@@ -134,7 +129,7 @@ def _report_command_failure(exc: BaseException) -> None:
 
 def main() -> None:
     """Console-script entrypoint."""
-    _force_utf8_std_streams()
+    force_utf8_std_streams()
     set_json_logs("--json-logs" in sys.argv)
     # Print banner only when stdout is a TTY, to avoid polluting pipelines.
     if sys.stdout.isatty() and not is_json_logs():

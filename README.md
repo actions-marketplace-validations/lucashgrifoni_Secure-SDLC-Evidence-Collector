@@ -217,6 +217,9 @@ required check passes and `1` when any required check fails (optional checks,
 such as a missing token or `cosign`, never fail). That `1` is not a
 `conditional` verdict. It is kept for compatibility in the 4.x line and will
 move to `3` in the next major release, in line with every other failure.
+`doctor` also runs on a broken install: if a required dependency such as
+`defusedxml` is missing, its `Import:` row fails and it exits `1`, while every
+other command prints one line naming the missing package and exits `3`.
 
 **Every failure that is not a release verdict exits `3`.** A missing or
 malformed bundle, an unreadable catalog, an invalid `--commit-sha`, an
@@ -234,6 +237,19 @@ traceback). The full taxonomy:
 A wrapper can therefore branch on the code alone. Outside `doctor`, `1` means
 `conditional` and nothing else; `3` means "nothing was produced, do not read
 this as a verdict".
+
+One input is deliberately not fatal: an input directory passed to `run`,
+`collect` or `evaluate` (`--artifacts-dir`, `--attestations-dir`,
+`--exceptions-dir`) that does not exist, or is a file. The command records it
+in the bundle's `collection_errors`, prints it under "Collection warnings" (a
+`collection_error` event with `--json-logs`), writes the bundle, and exits with
+the verdict for whatever evidence it did find. That is usually `2`
+(`not_ready`) when the missing directory held the evidence, but a missing
+`--exceptions-dir` next to complete evidence can still exit `0`. The GitHub
+Action passes a configured `exceptions-dir` through even when it is missing,
+and the reusable workflow and the GitLab template always pass
+`--artifacts-dir`; all three rely on getting a bundle back. To stop a pipeline
+on a missing directory, fail the step when `collection_errors` is not empty.
 
 > Before `3.0.0` this was inconsistent: `vex`, `guac`, `statement`, `enrich`
 > and `oscal` returned `2` for a malformed input — the same code as a
@@ -366,7 +382,8 @@ environment for you. Add to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/lucashgrifoni/Secure-SDLC-Evidence-Collector
-    rev: v4.0.0            # pin the release you run; the schema hook writes that release's contract
+    # Pin the release you run; the schema hook writes that release's contract.
+    rev: v4.1.0  # x-release-please-version
     hooks:
       - id: sdlc-evidence-validate-exceptions   # validate staged waiver files
       - id: sdlc-evidence-doctor                # smoke-test the pinned release
@@ -402,7 +419,9 @@ evidence does not claim an environment nobody asserted.
   followed; each one is reported as a collection error.
 - `--attestations-dir PATH` — folder with YAML/JSON attestations
   (repeatable).
-- `--catalog FILE.yaml` — override the default control catalog.
+- `--catalog FILE.yaml` — override the default control catalog: a path, or
+  the name of a bundled catalog with or without `.yaml` (`catalog-ssdf-1.2`
+  and `catalog-ssdf-1.2.yaml` both work).
 - `--artifact-root PATH` — base directory that absolute artifact paths
   are rewritten against, so the bundle records repo-relative paths
   instead of leaking local filesystem locations. Recommended in CI.

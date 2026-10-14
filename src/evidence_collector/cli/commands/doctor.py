@@ -3,95 +3,18 @@
 from __future__ import annotations
 
 import json
-import os
-import shutil
-import sys
-import tempfile
-from pathlib import Path
 from typing import Annotated
 
 import typer
 from rich.table import Table
 
 from evidence_collector.cli._logging import emit_event
+from evidence_collector.cli._preflight import doctor_checks, doctor_payload
 from evidence_collector.cli._state import console, is_json_logs
-from evidence_collector.domain.models import EvidenceBundle
 
-
-def doctor_checks() -> list[tuple[str, bool, str]]:
-    """Run the health checks. Returns (label, ok, detail) per check.
-
-    Pure function so it can be unit-tested without invoking Typer.
-    """
-    results: list[tuple[str, bool, str]] = []
-
-    # Python version: the package declares requires-python >= 3.12.
-    py_ok = sys.version_info >= (3, 12)
-    results.append(
-        (
-            "Python version",
-            py_ok,
-            f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro} "
-            f"({'>=3.12' if py_ok else 'requires >=3.12'})",
-        )
-    )
-
-    # Required runtime dependencies. We import them lazily so a partial
-    # install fails loudly instead of crashing every command silently.
-    deps = ["typer", "pydantic", "jinja2", "yaml", "httpx", "rich", "defusedxml"]
-    for module in deps:
-        try:
-            __import__(module)
-            results.append((f"Import: {module}", True, "ok"))
-        except ImportError as exc:  # pragma: no cover - exercised only on broken installs
-            results.append((f"Import: {module}", False, str(exc)))
-
-    # Optional credentials. These are not required for local runs. Without
-    # GITHUB_TOKEN, `run --pull-request/--workflow-run` still calls the GitHub
-    # API, just unauthenticated. No CLI command collects from GitLab.
-    for token_var, label, present_detail, absent_detail in (
-        (
-            "GITHUB_TOKEN",
-            "GitHub token (optional)",
-            "present (used by run --pull-request/--workflow-run)",
-            "absent (run --pull-request/--workflow-run call the GitHub API "
-            "unauthenticated: rate-limited, and private repositories return 404)",
-        ),
-        (
-            "GITLAB_TOKEN",
-            "GitLab token (optional)",
-            "present (library use only; no CLI command reads it)",
-            "absent (only read by the GitLabCollector library API; no CLI command uses it)",
-        ),
-    ):
-        present = bool(os.environ.get(token_var))
-        # Optional checks always count as "ok" — we just report status.
-        detail = present_detail if present else absent_detail
-        results.append((label, True, detail))
-
-    # Schema export sanity. Confirms Pydantic + the bundle model are in
-    # a healthy state without writing anything to the user's tree.
-    try:
-        EvidenceBundle.model_json_schema()
-        results.append(("Schema export", True, "EvidenceBundle.model_json_schema() ok"))
-    except Exception as exc:  # pragma: no cover - guard against future Pydantic regressions
-        results.append(("Schema export", False, f"{type(exc).__name__}: {exc}"))
-
-    # Write permissions. We never write outside an explicit --output-dir,
-    # but it is useful to confirm the user's cwd is writable.
-    try:
-        with tempfile.NamedTemporaryFile(dir=Path.cwd(), delete=True):
-            pass
-        results.append(("Write permission in cwd", True, str(Path.cwd())))
-    except OSError as exc:
-        results.append(("Write permission in cwd", False, f"{type(exc).__name__}: {exc}"))
-
-    # Optional cosign — used by the release workflow for keyless signing.
-    cosign_path = shutil.which("cosign")
-    cosign_detail = cosign_path or "not installed (only needed for signed releases)"
-    results.append(("cosign (optional)", True, cosign_detail))
-
-    return results
+# The checks live in `_preflight`, which imports the standard library only, so
+# they still run when a dependency this module needs is missing.
+__all__ = ["doctor_checks", "register"]
 
 
 def register(app: typer.Typer) -> None:
@@ -114,18 +37,9 @@ def register(app: typer.Typer) -> None:
         failed = [(label, detail) for label, ok, detail in results if not ok]
 
         if is_json_logs():
-            emit_event(
-                "doctor_checked",
-                checks=[
-                    {"check": label, "ok": ok, "detail": detail} for label, ok, detail in results
-                ],
-                failed=len(failed),
-            )
+            emit_event("doctor_checked", **doctor_payload(results))
         elif json_output:
-            payload = [
-                {"check": label, "ok": ok, "detail": detail} for label, ok, detail in results
-            ]
-            typer.echo(json.dumps({"checks": payload, "failed": len(failed)}, indent=2))
+            typer.echo(json.dumps(doctor_payload(results), indent=2))
         else:
             table = Table(title="sdlc-evidence doctor", show_header=True)
             table.add_column("Check")
