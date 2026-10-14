@@ -40,6 +40,43 @@ updates:
         update-types:
           - "version-update:semver-major"
 
+  # Hash-locked CI requirements (.github/requirements/*.in -> *.txt), generated
+  # by `uv pip compile --universal --generate-hashes`. Dependabot's uv ecosystem
+  # only handles uv.lock, so the pip ecosystem watches these requirement files:
+  # it bumps a pinned version together with its hashes. A full re-lock (new
+  # transitive dependencies) uses the command in each .txt header, and the
+  # `pip check` after every install fails CI if a bump leaves a lock inconsistent.
+  - package-ecosystem: "pip"
+    directory: "/.github/requirements"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "America/Sao_Paulo"
+    open-pull-requests-limit: 5
+    labels:
+      - "deps"
+      - "ci"
+    reviewers:
+      - "lucashgrifoni"
+    commit-message:
+      prefix: "chore(ci)"
+    cooldown:
+      default-days: 7
+      semver-minor-days: 7
+      semver-patch-days: 3
+    groups:
+      ci-requirements:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
+
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
