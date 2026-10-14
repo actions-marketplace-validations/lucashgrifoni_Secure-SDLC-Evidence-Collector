@@ -414,3 +414,54 @@ def test_a_catalog_alias_bomb_is_rejected(tmp_path: Path) -> None:
     local.write_text("\n".join(lines) + "\n" + _VALID_CONTROL, encoding="utf-8")
     with pytest.raises(ValueError, match="alias"):
         load_catalog(local)
+
+
+def test_a_bare_bundled_name_selects_the_bundled_catalog_without_a_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--catalog catalog-ssdf-1.2` (no extension) names a bundled catalog.
+
+    It cannot be a local file the user meant, so the substituted-control-set
+    warning, which still guards `catalog.yaml`, is noise there.
+    """
+    monkeypatch.chdir(tmp_path)
+    with caplog.at_level(logging.WARNING):
+        controls = load_catalog("catalog-ssdf-1.2")
+    assert controls
+    assert "BUNDLED" not in caplog.text
+
+
+def test_explicit_path_syntax_still_warns_when_it_falls_back(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`./name` says "my file here"; Path drops the `./`, so the raw text decides."""
+    monkeypatch.chdir(tmp_path)
+    with caplog.at_level(logging.WARNING):
+        controls = load_catalog("./catalog-ssdf-1.2")
+    assert controls
+    assert "BUNDLED" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "command",
+    [["controls"], ["oscal", "--kind", "catalog"]],
+    ids=["controls", "oscal-catalog"],
+)
+def test_cli_keeps_explicit_path_syntax_for_the_fallback_warning(
+    command: list[str],
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CLI must hand the raw `./name` text through, not a normalised Path."""
+    from typer.testing import CliRunner
+
+    from evidence_collector.cli.main import app
+
+    monkeypatch.chdir(tmp_path)
+    with caplog.at_level(logging.WARNING):
+        result = CliRunner().invoke(app, [*command, "--catalog", "./catalog-ssdf-1.2"])
+    assert result.exit_code == 0, result.output
+    assert "BUNDLED" in caplog.text
