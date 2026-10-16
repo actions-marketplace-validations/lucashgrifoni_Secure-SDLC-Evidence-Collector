@@ -480,6 +480,35 @@ not care which you choose.
   signed or that the source is authentic. Pipelines that need that
   guarantee must verify signatures before piping the file into
   `--consume`.
+- A consumed statement applies only when it names a product of this
+  release: the bundle's own `pkg:generic/<repository>@<release>` id or an
+  identifier passed with `--product` (a purl, CPE, CycloneDX ref or CSAF
+  product id; CSAF ids are also resolved to the purl or CPE in the
+  product tree, including relationship products). A versionless purl
+  covers every version of the package with the same
+  qualifiers and subpath; a statement for another version, or for the
+  same package from another repository (`?repository_url=`), does not
+  apply. Other identifiers match only exactly. A CycloneDX `affects`
+  entry with a `versions` array names only its explicit versions whose
+  own status agrees with the analysis (`unaffected` for `not_affected`
+  or a fix, `affected`, the default, for an exploitable finding); a
+  version `range` is not evaluated, and neither is `versions` on a
+  plain bom-ref, so such an entry names no product; a versioned purl
+  ref applies only when `versions` lists that version. Purls are compared
+  with their qualifiers sorted and their versions percent-decoded. With
+  more than one `--consume` file, CSAF product ids and CycloneDX bom-refs
+  are not matched (they are unique only inside their own document); name
+  the release by purl, CPE, URN (such as a CycloneDX BOM-Link) or
+  absolute IRI instead. CycloneDX bom-refs are resolved to the purl or
+  CPE of the component they point at, with the component's `version`
+  added to a versionless purl. A CSAF vulnerability yields one statement per status, naming the
+  products of every bucket that maps to it. Statements
+  that name no release product, including those that name no product at
+  all, are skipped and listed in a warning. Matching on the CVE id alone
+  let a VEX for an unrelated package silence a CVE the release carries.
+- CycloneDX justifications are translated into the five OpenVEX
+  justifications (the original is kept in `status_notes`); an unknown
+  justification falls back to `vulnerable_code_not_in_execute_path`.
 - Conflict policy (`first-wins`, `last-wins`, `fail`) decides what
   happens when sources disagree. `fail` is the right choice when an
   unexpected disagreement is itself a finding.

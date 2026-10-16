@@ -40,9 +40,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
+from urllib.parse import unquote
 from uuid import NAMESPACE_URL, uuid5
 
 from evidence_collector.domain.enums import ControlEvaluationStatus
@@ -80,6 +82,17 @@ STATUS_UNDER_INVESTIGATION = "under_investigation"
 # carry a specific reason; consumers can override by setting
 # `justification` directly on the exception scope in future schemas.
 DEFAULT_NOT_AFFECTED_JUSTIFICATION = "vulnerable_code_not_in_execute_path"
+
+# The five justifications OpenVEX 0.2.0 defines for ``not_affected``.
+OPENVEX_JUSTIFICATIONS = frozenset(
+    {
+        "component_not_present",
+        "vulnerable_code_not_present",
+        "vulnerable_code_not_in_execute_path",
+        "vulnerable_code_cannot_be_controlled_by_adversary",
+        "inline_mitigations_already_exist",
+    }
+)
 
 # Map CycloneDX inline-analysis ``state`` to an OpenVEX status. The
 # CycloneDX vocabulary is broader than OpenVEX (e.g. ``resolved`` vs
@@ -384,6 +397,74 @@ def build_openvex(bundle: EvidenceBundle, *, now: datetime | None = None) -> dic
     }
 
 
+def _openvex_justification(stmt: VexStatement) -> tuple[str, str | None]:
+    """Return an OpenVEX justification and, when it was translated, the original."""
+    raw = stmt.justification
+    if raw in OPENVEX_JUSTIFICATIONS:
+        return raw, None
+    if raw and stmt.source_shape == "cyclonedx-vex" and raw in _CYCLONEDX_JUSTIFICATION_TO_OPENVEX:
+        return _CYCLONEDX_JUSTIFICATION_TO_OPENVEX[raw], raw
+    return DEFAULT_NOT_AFFECTED_JUSTIFICATION, raw
+
+
+def _purl_parts(identifier: str) -> tuple[str, str | None]:
+    """Split ``pkg:type/ns/name@version?q#sub`` into (identity, version).
+
+    Only the version is taken out. Qualifiers (sorted) and the subpath stay in
+    the identity, so ``pkg:docker/acme/api?repository_url=a`` never stands for
+    the same image pulled from another registry.
+    """
+    rest, _, subpath = identifier.strip().partition("#")
+    core, _, query = rest.partition("?")
+    version: str | None = None
+    if "@" in core:
+        head, tail = core.rsplit("@", 1)
+        if "/" not in tail:
+            # Decoded: `1.0%2Bdeb1` and `1.0+deb1` are the same version.
+            core, version = head, unquote(tail)
+    qualifiers = "&".join(sorted(q for q in query.split("&") if q))
+    identity = core + (f"?{qualifiers}" if qualifiers else "") + (f"#{subpath}" if subpath else "")
+    return identity, version
+
+
+def _is_global_id(identifier: str) -> bool:
+    """True for identifiers that mean the same thing in every document.
+
+    Purls, CPEs, URNs (CycloneDX BOM-Links carry the BOM serial number) and
+    absolute IRIs, which OpenVEX allows as product ``@id``. CSAF product ids
+    and plain CycloneDX bom-refs are local to their document.
+    """
+    return identifier.startswith(("pkg:", "cpe:", "urn:")) or "://" in identifier
+
+
+def _names_release(
+    products: tuple[str, ...], release_products: set[str], *, local_ids: bool = True
+) -> bool:
+    """True when a statement names one of the release's products.
+
+    An exact identifier always matches. A versionless purl matches the same
+    package at any version, as OpenVEX allows; a statement for another
+    version of the product does not. Other identifiers (CPEs, CycloneDX refs,
+    CSAF product ids) only match exactly: an `@` in them is not a version.
+    With ``local_ids`` off, CycloneDX refs and CSAF product ids do not match
+    at all: they are unique only inside their own document.
+    """
+    release_parts = [_purl_parts(p) for p in release_products if p.startswith("pkg:")]
+    for product in products:
+        if product in release_products and (local_ids or _is_global_id(product)):
+            return True
+        if not product.startswith("pkg:"):
+            continue
+        # Compared normalized, so qualifier order does not matter.
+        name, version = _purl_parts(product)
+        if any(
+            name == r_name and (version is None or version == r_version)
+            for r_name, r_version in release_parts
+        ):
+            return True
+    return False
+
+
 def _statement_from_consumed(cve_id: str, product_id: str, stmt: VexStatement) -> dict[str, Any]:
     """Translate a consumed VEX statement into an OpenVEX statement dict."""
     out: dict[str, Any] = {
@@ -391,9 +472,12 @@ def _statement_from_consumed(cve_id: str, product_id: str, stmt: VexStatement) -
         "products": [{"@id": product_id}],
         "status": stmt.status,
     }
-    if stmt.status == STATUS_NOT_AFFECTED:
-        out["justification"] = stmt.justification or DEFAULT_NOT_AFFECTED_JUSTIFICATION
     notes: list[str] = []
+    if stmt.status == STATUS_NOT_AFFECTED:
+        justification, original = _openvex_justification(stmt)
+        out["justification"] = justification
+        if original:
+            notes.append(f"source justification={original}")
     if stmt.source_shape:
         notes.append(f"source={stmt.source_shape}")
     if stmt.source_path:
@@ -411,8 +495,17 @@ def merge_consumed_vex(
     consumed: list[VexStatement],
     *,
     policy: MergeConflictPolicy = MergeConflictPolicy.LAST_WINS,
+    products: Iterable[str] = (),
+    skipped: list[VexStatement] | None = None,
 ) -> dict[str, Any]:
     """Merge ``consumed`` VEX statements into a bundle-derived OpenVEX document.
+
+    A consumed statement applies only when it names one of the release's
+    products: the bundle's own purl-shaped id or one of ``products`` (the
+    release's real identifiers, such as its published purl). A statement about
+    any other product is set aside in ``skipped`` instead of being matched on
+    the CVE id alone, which let a VEX for an unrelated package silence a CVE
+    the release itself carries.
 
     Conflict policy semantics:
 
@@ -428,12 +521,21 @@ def merge_consumed_vex(
       pipelines where an unexpected disagreement is itself a finding.
     """
     product_id = _product_id(bundle)
+    release_products = {product_id, *(p.strip() for p in products if p.strip())}
     by_cve: dict[str, dict[str, Any]] = {
         s["vulnerability"]["name"]: s
         for s in bundle_document.get("statements", [])
         if isinstance(s, dict) and isinstance(s.get("vulnerability"), dict)
     }
+    # A CSAF product id or a CycloneDX bom-ref is unique only within its own
+    # document; with several documents, `--product CSAFPID-0001` would match
+    # unrelated products that reuse the token. Only purls and CPEs then count.
+    local_ids = len({stmt.source_path for stmt in consumed}) <= 1
     for stmt in consumed:
+        if not _names_release(stmt.products, release_products, local_ids=local_ids):
+            if skipped is not None:
+                skipped.append(stmt)
+            continue
         cve_id = stmt.cve_id.upper()
         new_statement = _statement_from_consumed(cve_id, product_id, stmt)
         existing = by_cve.get(cve_id)

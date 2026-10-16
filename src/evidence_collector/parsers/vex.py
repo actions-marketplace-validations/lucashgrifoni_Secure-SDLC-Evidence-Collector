@@ -15,8 +15,7 @@ discriminating top-level keys:
   ``vulnerabilities[*].product_status`` (``known_affected`` /
   ``known_not_affected`` / ``fixed`` / ``under_investigation``).
 
-SPDX VEX is deferred (low industry adoption; tracked under v2.1
-backlog).
+SPDX VEX is deferred (low industry adoption) and not scheduled.
 
 Normalization rules (canonical OpenVEX vocabulary):
 
@@ -35,6 +34,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import quote, unquote
 
 from evidence_collector.parsers._common import (
     ParseError,
@@ -83,6 +83,10 @@ class VexStatement:
     detail: str | None = None
     source_shape: VexShape | None = None
     source_path: str | None = None
+    # Product identifiers the source statement names (purl, CPE, CycloneDX
+    # ref or CSAF product id). The merger applies a statement only to the
+    # release it names; an empty tuple means the source named no product.
+    products: tuple[str, ...] = ()
 
 
 def _detect_shape(data: dict[str, Any]) -> VexShape:
@@ -129,6 +133,68 @@ def _normalise_cve(value: Any) -> str | None:
     return None
 
 
+def _strings(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    return [v.strip() for v in values if isinstance(v, str) and v.strip()]
+
+
+def _openvex_products(entry: dict[str, Any]) -> tuple[str, ...]:
+    products: list[str] = []
+    raw = entry.get("products")
+    for product in raw if isinstance(raw, list) else []:
+        if isinstance(product, str) and product.strip():
+            products.append(product.strip())
+        elif isinstance(product, dict):
+            ident = product.get("@id")
+            if isinstance(ident, str) and ident.strip():
+                products.append(ident.strip())
+            identifiers = product.get("identifiers")
+            if isinstance(identifiers, dict):
+                products.extend(
+                    v.strip() for v in identifiers.values() if isinstance(v, str) and v.strip()
+                )
+    return tuple(dict.fromkeys(products))
+
+
+def _csaf_identities(data: dict[str, Any]) -> dict[str, list[str]]:
+    """Map each CSAF product id to its purl / CPE from the product tree."""
+    identities: dict[str, list[str]] = {}
+
+    def visit(node: Any) -> None:
+        if isinstance(node, list):
+            for item in node:
+                visit(item)
+            return
+        if not isinstance(node, dict):
+            return
+        # Branch leaves carry `product`; relationships carry the derived
+        # product as a singular `full_product_name`.
+        candidates = [
+            value
+            for value in (node.get("product"), node.get("full_product_name"))
+            if isinstance(value, dict)
+        ]
+        names = node.get("full_product_names")
+        if isinstance(names, list):
+            candidates.extend(n for n in names if isinstance(n, dict))
+        for candidate in candidates:
+            pid = candidate.get("product_id")
+            helper = candidate.get("product_identification_helper")
+            if isinstance(pid, str) and isinstance(helper, dict):
+                identities.setdefault(pid, []).extend(
+                    v.strip()
+                    for key in ("purl", "cpe")
+                    for v in [helper.get(key)]
+                    if isinstance(v, str) and v.strip()
+                )
+        visit(node.get("branches"))
+        visit(node.get("relationships"))
+
+    visit(data.get("product_tree"))
+    return identities
+
+
 def _parse_openvex(data: dict[str, Any]) -> list[VexStatement]:
     statements_raw = data.get("statements")
     if not isinstance(statements_raw, list):
@@ -158,9 +224,118 @@ def _parse_openvex(data: dict[str, Any]) -> list[VexStatement]:
                     if isinstance(entry.get("status_notes"), str)
                     else None
                 ),
+                products=_openvex_products(entry),
             )
         )
     return out
+
+
+# Which `versions[].status` values agree with each OpenVEX status. CycloneDX
+# defaults a missing status to `affected`; `unknown` agrees with nothing but an
+# open investigation.
+_CDX_VERSION_STATUS_FOR: dict[str, frozenset[str]] = {
+    "affected": frozenset({"affected"}),
+    "not_affected": frozenset({"unaffected"}),
+    "fixed": frozenset({"unaffected"}),
+    "under_investigation": frozenset({"affected", "unaffected", "unknown"}),
+}
+
+
+def _cyclonedx_identities(data: dict[str, Any]) -> dict[str, list[str]]:
+    """Map each component or service ``bom-ref`` to its purl / CPE.
+
+    A versionless purl takes the component's own ``version``: resolved bare,
+    it would stand for every version of the package.
+    """
+    identities: dict[str, list[str]] = {}
+
+    def visit(node: Any) -> None:
+        if isinstance(node, list):
+            for item in node:
+                visit(item)
+            return
+        if not isinstance(node, dict):
+            return
+        ref = node.get("bom-ref")
+        if isinstance(ref, str) and ref.strip():
+            names: list[str] = []
+            purl = node.get("purl")
+            if isinstance(purl, str) and purl.strip():
+                purl = purl.strip()
+                version = node.get("version")
+                versionless = "@" not in purl.split("?", 1)[0].split("#", 1)[0]
+                if versionless and isinstance(version, str) and version.strip():
+                    purl = _constrain_purl(purl, {version.strip()})[0]
+                names.append(purl)
+            cpe = node.get("cpe")
+            if isinstance(cpe, str) and cpe.strip():
+                names.append(cpe.strip())
+            identities.setdefault(ref.strip(), []).extend(names)
+        visit(node.get("components"))
+        visit(node.get("services"))
+
+    metadata = data.get("metadata")
+    if isinstance(metadata, dict):
+        visit(metadata.get("component"))
+    visit(data.get("components"))
+    visit(data.get("services"))
+    return identities
+
+
+def _constrain_purl(purl: str, explicit: set[str]) -> list[str]:
+    """The versions of ``purl`` that a ``versions`` array leaves in scope."""
+    core = purl.split("?", 1)[0].split("#", 1)[0]
+    if "@" in core:
+        # A versioned purl keeps its meaning only when the constraint lists
+        # that same version; otherwise the two disagree and nothing is named.
+        return [purl] if unquote(core.rsplit("@", 1)[1]) in explicit else []
+    base, sep, rest = purl.partition("?")
+    if not sep:
+        base, sep, rest = purl.partition("#")
+    suffix = f"{sep}{rest}" if sep else ""
+    # Encoded as a canonical purl version: `1.0+deb1` becomes `1.0%2Bdeb1`.
+    return [f"{base}@{quote(version, safe='.-_~')}{suffix}" for version in sorted(explicit)]
+
+
+def _cyclonedx_affected_refs(
+    entry: dict[str, Any], status: str, identities: dict[str, list[str]]
+) -> list[str]:
+    """The product identifiers one CycloneDX ``affects`` entry names.
+
+    A bom-ref is resolved to the purl / CPE of the component it points at,
+    as CSAF product ids are. A versionless purl restricted by a ``versions``
+    array stands only for those versions: each explicit ``version`` whose own
+    status agrees with the analysis becomes ``purl@version``. A ``range`` is
+    not evaluated, so it contributes nothing; read as the bare ref it would
+    have covered every version of the package. With ``versions``, only purls
+    are named: a bare bom-ref or a CPE would drop the constraint. A purl that
+    already carries a version stays only when ``versions`` lists it.
+    """
+    ref = entry.get("ref")
+    if not isinstance(ref, str) or not ref.strip():
+        return []
+    ref = ref.strip()
+    names = [ref, *identities.get(ref, [])]
+    versions = entry.get("versions")
+    if not isinstance(versions, list) or not versions:
+        return names
+    # A version whose own status contradicts the analysis (`affected` under a
+    # `not_affected` analysis) is left out rather than given the wrong verdict.
+    agreeing = _CDX_VERSION_STATUS_FOR.get(status, frozenset())
+    explicit = {
+        item["version"].strip()
+        for item in versions
+        if isinstance(item, dict)
+        and isinstance(item.get("version"), str)
+        and item["version"].strip()
+        and str(item.get("status") or "affected") in agreeing
+    }
+    return [
+        constrained
+        for name in names
+        if name.startswith("pkg:")
+        for constrained in _constrain_purl(name, explicit)
+    ]
 
 
 def _parse_cyclonedx_vex(data: dict[str, Any]) -> list[VexStatement]:
@@ -168,6 +343,7 @@ def _parse_cyclonedx_vex(data: dict[str, Any]) -> list[VexStatement]:
     if not isinstance(vulns, list):
         return []
     out: list[VexStatement] = []
+    identities = _cyclonedx_identities(data)
     for vuln in vulns:
         if not isinstance(vuln, dict):
             continue
@@ -185,6 +361,13 @@ def _parse_cyclonedx_vex(data: dict[str, Any]) -> list[VexStatement]:
             continue
         justification_raw = analysis.get("justification")
         detail_raw = analysis.get("detail")
+        affects = vuln.get("affects")
+        refs = [
+            ref
+            for a in (affects if isinstance(affects, list) else [])
+            if isinstance(a, dict)
+            for ref in _cyclonedx_affected_refs(a, status, identities)
+        ]
         out.append(
             VexStatement(
                 cve_id=cve_id,
@@ -193,6 +376,7 @@ def _parse_cyclonedx_vex(data: dict[str, Any]) -> list[VexStatement]:
                     str(justification_raw) if isinstance(justification_raw, str) else None
                 ),
                 detail=str(detail_raw) if isinstance(detail_raw, str) else None,
+                products=tuple(dict.fromkeys(refs)),
             )
         )
     return out
@@ -203,6 +387,7 @@ def _parse_csaf(data: dict[str, Any]) -> list[VexStatement]:
     if not isinstance(vulns, list):
         return []
     out: list[VexStatement] = []
+    identities = _csaf_identities(data)
     for vuln in vulns:
         if not isinstance(vuln, dict):
             continue
@@ -212,15 +397,16 @@ def _parse_csaf(data: dict[str, Any]) -> list[VexStatement]:
         product_status = vuln.get("product_status")
         if not isinstance(product_status, dict):
             continue
-        # Pick the most specific bucket: known_affected wins over recommended
-        # because we want the "affected" signal explicit when both apply.
-        status: str | None = None
+        # One statement per OpenVEX status, each naming the products of every
+        # CSAF bucket that maps to it: `known_affected: [a]` beside
+        # `first_affected: [b]` marks both a and b affected.
+        ids_by_status: dict[str, list[str]] = {}
         for csaf_key, openvex_status in _CSAF_PRODUCT_STATUS_TO_OPENVEX.items():
             if csaf_key in product_status:
-                status = openvex_status
-                if openvex_status == "affected":
-                    break
-        if status is None:
+                ids_by_status.setdefault(openvex_status, []).extend(
+                    _strings(product_status.get(csaf_key))
+                )
+        if not ids_by_status:
             continue
         # Threats / impact text travels into ``detail`` so reviewers
         # keep the CSAF rationale visible after merge.
@@ -232,14 +418,19 @@ def _parse_csaf(data: dict[str, Any]) -> list[VexStatement]:
                 t = first.get("details")
                 if isinstance(t, str):
                     detail = t
-        out.append(
-            VexStatement(
-                cve_id=cve_id,
-                status=status,
-                justification=None,
-                detail=detail,
+        for status, product_ids in ids_by_status.items():
+            products = list(product_ids)
+            for pid in product_ids:
+                products.extend(identities.get(pid, []))
+            out.append(
+                VexStatement(
+                    cve_id=cve_id,
+                    status=status,
+                    justification=None,
+                    detail=detail,
+                    products=tuple(dict.fromkeys(products)),
+                )
             )
-        )
     return out
 
 
