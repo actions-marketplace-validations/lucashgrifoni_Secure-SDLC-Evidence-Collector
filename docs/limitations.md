@@ -96,10 +96,16 @@ The collector checks **presence**, not correctness.
   required fields, `extra='forbid'`) but the **content** of those
   fields is not audited. A `release_approval.yaml` naming `Approver:
   joe@example.com` is accepted at face value.
-- Suppressions (e.g. `.semgrepignore`, CodeQL `# lgtm[...]`) are
-  visible only if the underlying scanner reports them in its SARIF.
-  The collector does not flag "scan ran but everything was
-  suppressed".
+- Suppressions are visible only when the scanner writes them into its
+  SARIF. From 4.3.0, a result whose suppressions are all `accepted`, or
+  carry no status (a `# nosemgrep` line), is not counted as an open
+  finding; the number of such results is recorded in
+  `metadata.suppressed_count` and named in the evidence summary.
+  `underReview` and `rejected` suppressions leave the result open. Up to
+  4.2.0 a suppressed result was counted like any other. Code excluded
+  before the scan (a `.semgrepignore` entry, for example) never reaches
+  the SARIF, so the collector cannot see it. A scan in which every result
+  was suppressed still passes; the count is the only signal.
 - SBOM evidence carries a `metadata.cisa_2025_minimum_elements`
   presence map and a `metadata.cisa_2025_conformant` flag, checked
   against CISA's 2025 Minimum Elements for an SBOM (author, timestamp,
@@ -124,7 +130,7 @@ The collector checks **presence**, not correctness.
   documents. The CISA 2026 map is applied to SPDX 3.0, but most of its
   elements report `unsupported_mapping`.
 
-### Current development additions
+### CISA 2026 and AI SBOM mappings (since 4.0.0)
 
 The new CISA 2026 map covers 17 elements with explicit unsupported states.
 AI-bearing SBOMs also have 50 G7 presence states. Both are project mappings;
@@ -140,14 +146,24 @@ context, CR26 source versions, catalog changes and output-lock recovery.
 - It is **not** a full SSDF implementation (PS.1, PS.3-partial, PW.2,
   PW.5, PW.6, RV.* are out of scope). Custom catalogs via `--catalog`
   are the supported extension point.
-- Criticality values are advisory. The release-status rule only cares
-  about `critical` and `high`; `medium` and `low` controls drop the
-  verdict to `conditional` at worst.
+- Criticality decides the verdict. A gap on a `critical` control makes
+  the release `not_ready`; a gap on any other control, `high` included,
+  makes it `conditional` at worst. In the default catalog the scanner and
+  test controls are `high`, so a release with no SAST, SCA, secrets or test
+  evidence but every critical control met is `conditional`, which exits `0`
+  under the default `--fail-on not_ready`. The bundled
+  `catalog-fedramp-cr26` has only `high` controls, so it never returns
+  `not_ready`. Use `--fail-on conditional` when those gaps must block.
 
 ## 5 · SCM coverage
 
-- Only GitHub and GitLab are first-class. Azure DevOps and Bitbucket
-  are on the roadmap but not implemented.
+- GitHub is reachable from the CLI (`run --pull-request` and
+  `--workflow-run`). GitLab merge requests and pipelines are read only
+  through the `GitLabCollector` Python API; no CLI option, Action input or
+  GitLab component input uses it. Azure DevOps and Bitbucket collectors are
+  not implemented and not scheduled; they are listed in
+  [Discussion #188](https://github.com/lucashgrifoni/Secure-SDLC-Evidence-Collector/discussions/188)
+  as built on demand.
 - GitHub code review reads every page of REST `/pulls/:n/reviews` and
   keeps each reviewer's latest decisive review (`APPROVED`,
   `CHANGES_REQUESTED` or `DISMISSED`; `COMMENTED` and pending reviews do
@@ -230,11 +246,49 @@ context, CR26 source versions, catalog changes and output-lock recovery.
 - An **empty** result class produces no evidence at all, rather than a
   passing one. "Trivy found no secrets" and "Trivy was not asked about
   secrets" are different claims, and the report cannot tell them apart.
+- A clean report, which Trivy writes without a `Results` key, produces no
+  evidence, for the same reason. From 4.3.0 it is recognised as a Trivy
+  report; up to 4.2.0 it was listed among the files that matched no
+  parser.
+- The dependency and `config` classes fail on a critical or high
+  finding. From 4.3.0 the `secret` class fails on any finding, whatever
+  its severity, because every entry is a detected secret; the counts keep
+  the severity Trivy reported. Up to 4.2.0 a report holding only medium,
+  low or unknown-severity secrets passed.
 - Misconfigurations whose `Status` is `PASS` (present when Trivy runs with
   `--include-non-failures`) are not counted as findings.
 - Only the dependency lane carries `cve_ids`. Secret rule ids and
   misconfiguration check ids are not CVEs and are never fed to EPSS/KEV
   enrichment as if they were.
+
+## 6c · GitLab Security Reports
+
+- A JSON file is read as a GitLab Security Report when its `version` has
+  major 15, it has a `vulnerabilities` array, and `scan.type` is `sast`,
+  `secret_detection`, `dependency_scanning`, `container_scanning` or
+  `dast`. The file name plays no part, as in GitLab itself. Other scan
+  types (API fuzzing, coverage fuzzing, cluster image scanning) and other
+  schema majors are listed among the files that matched no parser.
+- `sast` becomes `sast_scan`, `secret_detection` becomes `secrets_scan`,
+  `dependency_scanning` and `container_scanning` become `sca_scan`, and
+  `dast` becomes `dast_scan`. Container scanning shares `sca_scan` with
+  Trivy's `os-pkgs` results; there is no container evidence type.
+- One report is one evidence. An empty `vulnerabilities` array is a passed
+  scan: unlike a Trivy result class, `scan.type` states which scan ran.
+- `scan.status: failure` makes the evidence `invalid`. In a secrets scan any
+  finding fails it, whatever its severity; otherwise a critical or high
+  finding fails it. Severities are counted as reported, and a word outside
+  the schema's list counts as `unknown`.
+- `cve_ids` come only from identifiers typed `cve`. The top-level `cve`
+  field of a finding is a location key in SAST reports and is not used.
+- Vulnerability flags (such as GitLab's likely-false-positive flag),
+  remediations, dependency lists and `scanned_resources` are not read. A
+  flagged finding still counts.
+- Checked against reports from GitLab's `semgrep:6`, `secrets:7`,
+  `gemnasium-python:6`, `container-scanning:8` and `dast:6` analyzer images
+  (`tests/fixtures/real/gitlab/`). No capture of a failed scan exists: an
+  analyzer that cannot run usually writes no report, which leaves the
+  control missing.
 
 ## 7 · Signing verification
 
@@ -320,6 +374,14 @@ context, CR26 source versions, catalog changes and output-lock recovery.
   paths before ingestion, so Linux and Windows should produce the same
   bundle — the `test_sample_release_bundle_is_stable_across_artifact_reorder`
   regression test catches drift if this ever changes.
+- Catalogs and attestation files are hashed as raw bytes, so the same
+  YAML saved with CRLF line endings gives a different `catalog.sha256` or
+  different evidence ids, and a different structural digest, than the LF
+  copy. A repository checked out on Windows with
+  `core.autocrlf=true` (the Git for Windows default) and on Linux can
+  therefore pin different digests for identical content. Add
+  `*.yaml text eol=lf` and `*.yml text eol=lf` (or `* text=auto eol=lf`,
+  as this repository does) to `.gitattributes` so every runner sees LF.
 - Output files are written with LF line endings on every platform.
   Before 3.0 they were written in the platform's default text mode, so
   a bundle produced on Windows differed from the same bundle produced
@@ -336,10 +398,10 @@ context, CR26 source versions, catalog changes and output-lock recovery.
 - No streaming mode: every artifact is parsed into memory and held
   until export. Very large bundles may need a catalog split.
 
-## 10 · Scope out of bug-bounty
+## 10 · Out of scope for vulnerability reports
 
-These are explicitly out of scope for security reports (see
-`SECURITY.md`):
+The project has no paid bug bounty. These are out of scope for security
+reports (see `SECURITY.md`):
 
 - issues in third-party SARIF / SBOM parsers we call,
 - DoS that requires privileged filesystem access,
@@ -378,11 +440,16 @@ not care which you choose.
 ## 11 · Things the verdict does **not** imply
 
 - `ready` does **not** mean "legally compliant with SSDF / PCI-DSS /
-  SOC 2 / ISO 27001". It means "every required critical and high
-  control in the active catalog has evidence attached".
-- `conditional` does **not** mean "ship at your own risk". It means
-  "medium-criticality gaps or only recommended-evidence gaps remain —
-  review them before promotion".
+  SOC 2 / ISO 27001". It means "every control in the active catalog is
+  met, waived or not applicable, with no required or recommended evidence
+  missing".
+- `conditional` does **not** mean "ship at your own risk", and it does
+  not mean only minor gaps remain. It means no critical control lacks
+  required evidence, but a `high`, `medium` or `low` control lacks
+  required evidence, or only recommended evidence is missing. A missing
+  SAST or SCA scan in the default catalog is a `high` gap, so it gives
+  `conditional`, which exits `0` under the default `--fail-on not_ready`.
+  Review the gaps before promotion, or gate with `--fail-on conditional`.
 - `not_ready` does **not** automatically mean "the release is
   broken". A critical control without evidence may also reflect an
   immature evidence pipeline rather than an unsafe release.
@@ -423,7 +490,7 @@ not care which you choose.
   view as a separate, time-bound delta. The base bundle is
   byte-stable across runs on identical inputs.
 
-## 14 · Risk-weighted verdict only downgrades (T6.6)
+## 14 · Risk-weighted verdict only downgrades
 
 - Freshly collected evidence never carries EPSS / KEV data; only
   `sdlc-evidence enrich` attaches it, to an existing bundle. So
@@ -491,7 +558,7 @@ not care which you choose.
   is removed from the exploitable count. The collector trusts the
   upstream reachability tool; it does not second-guess the verdict.
 
-## 15 · Reachability is not re-derived by the collector (§3.2)
+## 15 · Reachability is not re-derived by the collector
 
 - The `Reachability` field is populated by external tools
   (CodeQL reachability, Endor Labs, Semgrep Pro, manual review).
@@ -503,7 +570,7 @@ not care which you choose.
   so a missing reachability tool cannot silently suppress a real
   signal.
 
-## 16 · Multi-VEX consumer trusts the upstream verdict (T6.7)
+## 16 · Multi-VEX consumer trusts the upstream verdict
 
 - `sdlc-evidence vex --consume <file>` merges external VEX
   (OpenVEX, CycloneDX VEX, CSAF) into the bundle-derived statements.
@@ -542,7 +609,11 @@ not care which you choose.
   justification falls back to `vulnerable_code_not_in_execute_path`.
 - Conflict policy (`first-wins`, `last-wins`, `fail`) decides what
   happens when sources disagree. `fail` is the right choice when an
-  unexpected disagreement is itself a finding.
+  unexpected disagreement is itself a finding. Under `fail` a conflict
+  exits `3` and writes no document, the same code and event (`vex_failed`)
+  as an unreadable bundle. Tell them apart by the event: a conflict carries
+  a `policy` key and a reason starting with `VEX merge conflict:` (see the
+  [JSON logs event reference](json-logs.md)).
 - SPDX VEX is deferred (low industry adoption) and not scheduled.
 - Exceptions waive controls, not CVEs. The bundle-derived document marks a
   CVE `not_affected` only when a waiver actually applies to it: the
@@ -566,12 +637,11 @@ not care which you choose.
   bundle are byte-identical and different statements (including after
   `--consume` merges) never share an id; `version` stays `1`.
 
-## 17 · Watch daemon deferred, not scheduled (T6.9)
+## 17 · Watch daemon deferred, not scheduled
 
 - The roadmap pairs the GUAC adapter with a ``sdlc-evidence watch``
   daemon (webhook receiver, durable cursor, delta bundles for
-  continuous ATO). That subcommand was planned for v2.1 and is not
-  scheduled, because it requires an optional ``[watch]`` extra (FastAPI +
+  continuous ATO). That subcommand is not scheduled, because it requires an optional ``[watch]`` extra (FastAPI +
   uvicorn + watchdog) and durable cursor persistence the
   file-first collector deliberately avoids.
 - GUAC and regulatory profiles provide projections of supplied evidence;

@@ -35,6 +35,7 @@ def register(app: typer.Typer) -> None:
             typer.Argument(
                 # No exists=True, for the same reason as `vex`: Click would exit 2
                 # (the not_ready code) before the body can exit EXIT_INPUT_ERROR.
+                metavar="BUNDLE_PATH",
                 file_okay=True,
                 dir_okay=False,
                 readable=True,
@@ -74,7 +75,7 @@ def register(app: typer.Typer) -> None:
                 "sarif_emitted", bundle=str(bundle_path), output=str(output), results=results
             )
         else:
-            console.print(f"[green]SARIF[/green] · {results} unmet control(s) → {output}")
+            console.print(f"[output]SARIF[/output] · {results} unmet control(s) → {output}")
 
 
 def _artifact_uri(bundle_path: Path) -> str:

@@ -28,7 +28,9 @@ classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Intended Audience :: Information Technology",
-    "Operating System :: OS Independent",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -92,6 +94,7 @@ attestation = "evidence_collector.parsers:parse_attestation"
 exception = "evidence_collector.parsers:parse_exception"
 vsa = "evidence_collector.parsers:parse_vsa"
 provenance = "evidence_collector.parsers:parse_provenance"
+gitlab = "evidence_collector.parsers:parse_gitlab_security_report"
 
 [project.entry-points."evidence_collector.collectors"]
 local = "evidence_collector.collectors.local:LocalArtifactCollector"
@@ -100,6 +103,7 @@ gitlab = "evidence_collector.collectors.gitlab:GitLabCollector"
 
 [project.urls]
 Homepage = "https://github.com/lucashgrifoni/Secure-SDLC-Evidence-Collector"
+Documentation = "https://lucashgrifoni.github.io/Secure-SDLC-Evidence-Collector/docs/"
 Issues = "https://github.com/lucashgrifoni/Secure-SDLC-Evidence-Collector/issues"
 Changelog = "https://github.com/lucashgrifoni/Secure-SDLC-Evidence-Collector/blob/main/CHANGELOG.md"
 Source = "https://github.com/lucashgrifoni/Secure-SDLC-Evidence-Collector"

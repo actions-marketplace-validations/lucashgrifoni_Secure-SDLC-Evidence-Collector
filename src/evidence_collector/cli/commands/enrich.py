@@ -81,6 +81,7 @@ def register(app: typer.Typer) -> None:
                 # raises UsageError -> exit 2, the not_ready code. The body below
                 # already catches OSError and exits EXIT_INPUT_ERROR, which is what
                 # the README promises for every input failure.
+                metavar="BUNDLE_PATH",
                 file_okay=True,
                 dir_okay=False,
                 readable=True,
@@ -210,7 +211,7 @@ def register(app: typer.Typer) -> None:
             )
         else:
             console.print(
-                "[green]enriched[/green] "
+                "[output]enriched[/output] "
                 f"evidence={report.evidence_enriched}/{report.evidence_with_cves} "
                 f"cves={report.distinct_cves} kev={report.cves_in_kev} "
                 # Feed dates are read from the feed files, so they are escaped.

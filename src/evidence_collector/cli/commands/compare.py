@@ -54,8 +54,10 @@ def register(app: typer.Typer) -> None:
 
     @app.command("compare")
     def cmd_compare(
-        before: Annotated[Path, typer.Argument(help="Path to the baseline bundle.json")],
-        after: Annotated[Path, typer.Argument(help="Path to the new bundle.json")],
+        before: Annotated[
+            Path, typer.Argument(metavar="BEFORE", help="Path to the baseline bundle.json")
+        ],
+        after: Annotated[Path, typer.Argument(metavar="AFTER", help="Path to the new bundle.json")],
         output_format: Annotated[
             str, typer.Option("--format", help="Output format: table or json")
         ] = "table",
@@ -143,7 +145,7 @@ def register(app: typer.Typer) -> None:
         # so the control movement above is not mistaken for evidence movement.
         if comparison.catalog_drift and comparison.before_catalog and comparison.after_catalog:
             console.print(
-                "[yellow]Catalog changed:[/yellow] baseline was evaluated against "
+                "[status.warn]Catalog changed:[/status.warn] baseline was evaluated against "
                 f"{_describe_catalog(comparison.before_catalog)}; candidate against "
                 f"{_describe_catalog(comparison.after_catalog)}. Control changes marked "
                 "'(catalog)' may come from the catalog rather than the evidence."
@@ -158,7 +160,7 @@ def register(app: typer.Typer) -> None:
                 if catalog is None
             ]
             console.print(
-                f"[yellow]Catalog unknown:[/yellow] the {' and '.join(missing)} bundle "
+                f"[status.warn]Catalog unknown:[/status.warn] the {' and '.join(missing)} bundle "
                 "records no control catalog (made before catalog provenance was recorded). "
                 "Control changes cannot be attributed to the evidence rather than to a "
                 "catalog change."
@@ -171,7 +173,7 @@ def register(app: typer.Typer) -> None:
         # quietly misleads.
         if comparison.epss_model_drift:
             console.print(
-                "[yellow]EPSS model drift:[/yellow] baseline used "
+                "[status.warn]EPSS model drift:[/status.warn] baseline used "
                 f"{escape(', '.join(comparison.before_epss_model_versions))}; candidate used "
                 f"{escape(', '.join(comparison.after_epss_model_versions))}. "
                 "EPSS scores are not comparable across model versions — treat any "

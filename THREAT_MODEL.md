@@ -80,10 +80,16 @@ itself.
 | **Symbolic link target outside artifacts dir** | Directory links (symlinks and Windows junctions) below a walked directory are never followed; each is recorded as a collection error instead of being skipped silently. A directory passed on the command line may itself be a link. File links are followed and ingested: `ensure_file()` neither resolves the path nor checks containment (residual risk below). |
 | **Pydantic validation bypass via `extra` fields** | Every domain model sets `extra="forbid"`; unknown keys are a hard error.                                                  |
 
-Residual risk: a malformed file that satisfies the formal schema but
-encodes nonsense (e.g. negative test counts) is accepted. We treat
-this as the operator's responsibility — the bundle records the
-artifact's SHA-256 so tampering after-the-fact is detectable.
+Residual risk: a file that satisfies the formal schema but states
+something false is accepted, for example a JUnit report that declares
+more passing tests than ran. From 4.3.0 the JUnit parser corrects what
+cannot be true: a negative count is read as 0, and each count is the
+larger of the suite attribute and the matching `<testcase>` elements, so
+a suite that omits `failures` but holds a failing test case fails. Up to
+4.2.0 only the suite attributes were read, so that suite passed. Beyond
+that we treat the content as the operator's responsibility; the bundle
+records the artifact's SHA-256 so tampering after the fact is
+detectable.
 
 Residual risk: **file** links are followed by design. A symbolic link
 to a file inside an artifacts directory is ingested like a regular file
