@@ -12,6 +12,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from evidence_collector.parsers import parse_osv
 
 
@@ -162,3 +164,96 @@ def test_parse_osv_single_record_skips_malformed_affected(tmp_path: Path) -> Non
     assert parsed.ecosystems == ["crates.io"]
     assert parsed.cve_ids == ["CVE-2031-2222"]
     assert parsed.package_count == 1
+
+
+def _grouped_report(groups: Any) -> dict[str, Any]:
+    # The shape of the OSV-Scanner output documentation: aliased advisories
+    # are listed separately under vulnerabilities and clustered by groups.
+    package: dict[str, Any] = {
+        "package": {"name": "github.com/gogo/protobuf", "ecosystem": "Go"},
+        "vulnerabilities": [
+            {
+                "id": "GHSA-c3h9-896r-86jm",
+                "aliases": ["CVE-2021-3121"],
+                "severity": [
+                    {"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"}
+                ],
+            },
+            {"id": "GO-2021-0053", "aliases": ["CVE-2021-3121", "GHSA-c3h9-896r-86jm"]},
+            {"id": "GHSA-other", "database_specific": {"severity": "LOW"}},
+        ],
+    }
+    if groups is not None:
+        package["groups"] = groups
+    return {"results": [{"packages": [package]}]}
+
+
+def test_osv_groups_count_aliases_once(tmp_path: Path) -> None:
+    groups = [
+        {"ids": ["GHSA-c3h9-896r-86jm", "GO-2021-0053"], "max_severity": "7.5"},
+        {"ids": ["GHSA-other"]},
+    ]
+    parsed = parse_osv(_write(tmp_path, _grouped_report(groups)))
+    assert parsed.total_findings == 2
+    # The unrated alias does not add a medium next to the rated record.
+    assert parsed.findings_count == {"critical": 0, "high": 1, "medium": 0, "low": 1, "info": 0}
+    assert parsed.cve_ids == ["CVE-2021-3121"]
+
+
+def test_osv_group_takes_max_severity_when_no_member_is_rated(tmp_path: Path) -> None:
+    payload = _grouped_report([{"ids": ["GO-2021-0053"], "max_severity": "9.8"}])
+    payload["results"][0]["packages"][0]["vulnerabilities"] = [
+        {"id": "GO-2021-0053", "aliases": ["CVE-2021-3121"]}
+    ]
+    parsed = parse_osv(_write(tmp_path, payload))
+    assert parsed.total_findings == 1
+    assert parsed.findings_count["critical"] == 1
+
+
+def test_osv_without_groups_counts_each_record(tmp_path: Path) -> None:
+    parsed = parse_osv(_write(tmp_path, _grouped_report(None)))
+    assert parsed.total_findings == 3
+    assert parsed.findings_count["high"] == 1
+    assert parsed.findings_count["medium"] == 1
+    assert parsed.findings_count["low"] == 1
+
+
+def test_osv_vulnerability_outside_every_group_still_counts(tmp_path: Path) -> None:
+    groups = [{"ids": ["GHSA-c3h9-896r-86jm", "GO-2021-0053"]}]
+    parsed = parse_osv(_write(tmp_path, _grouped_report(groups)))
+    assert parsed.total_findings == 2
+    assert parsed.findings_count["low"] == 1
+
+
+@pytest.mark.parametrize(
+    ("record_id", "groups"),
+    [
+        (["GHSA-1"], None),
+        ({"value": "GHSA-1"}, None),
+        ("GHSA-1", [{"ids": [["GHSA-1"]]}]),
+        ("GHSA-1", [{"ids": [{"value": "GHSA-1"}]}]),
+        ("GHSA-1", [{"ids": ["GHSA-unknown"]}]),
+    ],
+    ids=[
+        "record-id-list",
+        "record-id-dict",
+        "group-id-list",
+        "group-id-dict",
+        "group-matches-no-record",
+    ],
+)
+def test_osv_ids_that_are_not_strings_do_not_stop_the_parse(
+    tmp_path: Path, record_id: Any, groups: Any
+) -> None:
+    # A list or dict where an id belongs is unhashable; looking it up raised
+    # TypeError and ended the whole run. Only string ids take part in the
+    # grouping, and the record still counts once at the medium fallback.
+    package: dict[str, Any] = {
+        "package": {"name": "a", "ecosystem": "npm"},
+        "vulnerabilities": [{"id": record_id}],
+    }
+    if groups is not None:
+        package["groups"] = groups
+    parsed = parse_osv(_write(tmp_path, {"results": [{"packages": [package]}]}))
+    assert parsed.total_findings == 1
+    assert parsed.findings_count["medium"] == 1
