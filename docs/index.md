@@ -10,6 +10,10 @@ operate it in a real pipeline**.
 - **[Bundle schema reference](./bundle_schema.md)** — the canonical
   shape of `bundle.json` that pipelines consume and policy engines
   validate.
+- **[JSON logs event reference](./json-logs.md)** — every NDJSON event
+  the CLI emits under `--json-logs`, with its payload keys.
+- **[Upgrading](./upgrading.md)** — changes to verdicts, exit codes and
+  outputs in each release, with what to do about each.
 - **[GitHub Action documentation](./github_action.md)** — inputs,
   outputs, examples, and recipes for using the action in your release
   workflows.
@@ -23,8 +27,8 @@ operate it in a real pipeline**.
   does not do, so adopters do not assume coverage that is not there.
 - **[Traceability matrix](./traceability.md)** — control-to-evidence
   mapping with NIST SSDF and OWASP SAMM coordinates.
-- **[Maturity roadmap](./MATURITY_ROADMAP.md)** — the public roadmap for
-  future hardening and adoption work.
+- **[Maturity roadmap](./MATURITY_ROADMAP.md)** — the hardening and
+  adoption plan, with what has shipped and what is deferred.
 - **[Architecture decision records](./adr/README.md)** — the
   non-obvious decisions that shape this project and the reasoning
   behind them.
@@ -35,7 +39,7 @@ operate it in a real pipeline**.
 |--------------------------------------|-------------------------------------------------------------------------------------------|
 | CLI (`sdlc-evidence`)                | `src/evidence_collector/cli/main.py`                                                      |
 | GitHub Action                        | [`action.yml`](https://github.com/lucashgrifoni/Secure-SDLC-Evidence-Collector/blob/main/action.yml) |
-| Container image                      | `publish-pypi.yml` builds and signs `ghcr.io/lucashgrifoni/secure-sdlc-evidence-collector` (multi-arch, cosign keyless + SBOM attestation) on tag push. Every release since `2.0.0` is published and verifiable. |
+| Container image                      | `publish-pypi.yml` builds and signs `ghcr.io/lucashgrifoni/secure-sdlc-evidence-collector` (multi-arch, cosign keyless + SBOM attestation) on tag push. Every release since `2.0.0` is published and verifiable, except `3.0.0`, whose pipeline failed before anything was signed. |
 | Wheel + sdist                        | Built and signed by `publish-pypi.yml`; PyPI publishing depends on the repository's Trusted Publisher configuration in PyPI. |
 | Bundle JSON Schema                   | Exported by `sdlc-evidence schema`; validated in CI on every run.                         |
 
@@ -44,8 +48,10 @@ operate it in a real pipeline**.
 `publish-pypi.yml` is configured to sign every release artifact with
 **cosign keyless** and records each signature on the **Sigstore Rekor**
 transparency log. `2.0.0` was the first public release; every release since is
-signed, so the commands below work today against any published tag. Set the
-version you want to verify — the examples use the installed one:
+signed, so the commands below work against any published tag. The one
+exception is `3.0.0`: its release pipeline failed before anything was signed,
+so it has no release assets, PyPI upload or container image. Set the version
+you want to verify — the examples use the installed one:
 
 ```bash
 VERSION=$(sdlc-evidence --version)
@@ -53,13 +59,15 @@ VERSION=$(sdlc-evidence --version)
 
 Download the wheel and its signature assets from the matching
 [GitHub Release](https://github.com/lucashgrifoni/Secure-SDLC-Evidence-Collector/releases),
-then verify the wheel:
+then verify the wheel. `--certificate-identity` pins the signer to the
+release workflow running for that exact tag, so a signature made by any other
+workflow or branch of the repository does not verify:
 
 ```bash
 cosign verify-blob \
   --certificate "secure_sdlc_evidence_collector-${VERSION}-py3-none-any.whl.pem" \
   --signature "secure_sdlc_evidence_collector-${VERSION}-py3-none-any.whl.sig" \
-  --certificate-identity-regexp 'https://github.com/lucashgrifoni/Secure-SDLC-Evidence-Collector' \
+  --certificate-identity "https://github.com/lucashgrifoni/Secure-SDLC-Evidence-Collector/.github/workflows/publish-pypi.yml@refs/tags/v${VERSION}" \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   "secure_sdlc_evidence_collector-${VERSION}-py3-none-any.whl"
 ```
@@ -68,7 +76,7 @@ Verify the container image:
 
 ```bash
 cosign verify "ghcr.io/lucashgrifoni/secure-sdlc-evidence-collector:v${VERSION}" \
-  --certificate-identity-regexp 'https://github.com/lucashgrifoni/Secure-SDLC-Evidence-Collector' \
+  --certificate-identity "https://github.com/lucashgrifoni/Secure-SDLC-Evidence-Collector/.github/workflows/publish-pypi.yml@refs/tags/v${VERSION}" \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
 ```
 
