@@ -15,12 +15,26 @@ from pathlib import Path
 
 import pytest
 import yaml
+from packaging.version import Version
 
 _REQUIREMENTS = Path(".github/requirements")
 _PYPROJECT = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]
 # Installs the release the CALLER picks, in the caller's repository, where
 # these locks do not exist.
 _CALLER_CHOSEN = {Path(".github/workflows/reusable-evidence-collection.yml")}
+# First release that fixes the advisories raised against these locks. A pin
+# below it installs a known vulnerability, so a floor only ever moves up.
+_ADVISORY_FIXES = {
+    "certifi": Version("2026.10.18"),  # GHSA-6q48-6c7w-9gw2
+    "filelock": Version("4.2.1"),  # GHSA-v4x8-3wr5-3wq8 and the rest of that batch
+    "opentelemetry-api": Version("1.45.2"),  # GHSA-mf5v-w3w3-f6cg, GHSA-xcq7-p3pf-p88h
+    "uv": Version("0.13.4"),  # GHSA-hq85-5cpj-mr62
+    "virtualenv": Version("21.14.9"),  # GHSA-c978-59m8-c77v and the rest of that batch
+}
+# Pins no lock refresh can move. Every semgrep release up to 1.185.0 requires
+# opentelemetry-api~=1.37.0 and mcp==1.29.0. The sast-semgrep job runs
+# `semgrep scan` without --trace and never starts the MCP server.
+_HELD_BY_UPSTREAM = {"semgrep.txt": {"opentelemetry-api"}}
 
 
 def _specs(name: str) -> set[str]:
@@ -60,6 +74,24 @@ def test_every_input_has_a_universal_hashed_lock(in_file: str) -> None:
     for option in ("--universal", "--generate-hashes", "--python-version 3.12"):
         assert option in header, f"{in_file}: lock not compiled with {option}"
     assert "--hash=sha256:" in lock
+
+
+def _pins(lock: str) -> list[tuple[str, Version]]:
+    text = (_REQUIREMENTS / lock).read_text(encoding="utf-8")
+    pins = re.findall(r"^([\w.-]+)==([^\s;]+)", text, flags=re.MULTILINE)
+    return [(name.lower(), Version(version)) for name, version in pins]
+
+
+@pytest.mark.parametrize("lock", sorted(p.name for p in _REQUIREMENTS.glob("*.txt")))
+def test_no_lock_pins_a_release_older_than_an_advisory_fix(lock: str) -> None:
+    vulnerable = [
+        f"{name}=={version}"
+        for name, version in _pins(lock)
+        if name in _ADVISORY_FIXES
+        and version < _ADVISORY_FIXES[name]
+        and name not in _HELD_BY_UPSTREAM.get(lock, set())
+    ]
+    assert not vulnerable, f"{lock}: pinned below the advisory fix: {vulnerable}"
 
 
 def _pip_installs(text: str) -> list[str]:

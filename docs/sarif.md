@@ -2,7 +2,9 @@
 
 `sdlc-evidence sarif` writes the controls a release did not meet as a
 SARIF 2.1.0 log, so they show up in a code scanning dashboard next to
-the findings of the scanners that fed the bundle.
+the findings of the scanners that fed the bundle. How the collector
+reads the SARIF your scanners write is described
+[at the end of this page](#how-scanner-sarif-is-read).
 
 ```sh
 sdlc-evidence sarif output/sample_release/bundle.json -o gaps.sarif
@@ -50,3 +52,39 @@ code scanning, add an upload step after the command, for example:
 
 The upload step needs `security-events: write`. On a private repository
 code scanning also needs GitHub Advanced Security.
+
+## How scanner SARIF is read
+
+Every `runs[]` entry of a scanner's SARIF becomes one evidence record.
+The driver name picks the evidence type (see
+[limitations §2](limitations.md#2-sarif-classification-heuristic)), and
+the results decide its status.
+
+| SARIF content | What the collector does |
+|---|---|
+| `result.level` | Used as is: `error` is high, `warning` medium, `note` low, `none` info. |
+| No `level`, `kind` other than `fail` | Level `none` (info). |
+| No `level` | The `defaultConfiguration.level` of the rule the result references through `ruleIndex` or `rule.index`, then `rule.guid`, then `ruleId` or `rule.id`, in the driver or in the component `rule.toolComponent` names by index, guid or name; `warning` when no rule sets one. |
+| Rule property `security-severity` | Raises the bucket to critical (9.0 and up), high (7.0) or medium (4.0) when that is above the level's bucket. It never lowers it. |
+| `invocations[].executionSuccessful: false` | The record is `invalid` at low confidence and does not satisfy a control. |
+| No `results` array | Zero findings, low confidence, `metadata.results_absent: true`, and a warning. SARIF reserves `results: []` for a run that found nothing. |
+| Error-level `toolExecutionNotifications` or `toolConfigurationNotifications` | Low confidence, `metadata.tool_error_notifications`, and a warning. The status is unchanged. |
+| `suppressions` all `accepted` or without a status | Not an open finding: left out of the counts, recorded in `metadata.suppressed_count` and named in the summary. |
+| A suppression `underReview` or `rejected` | Still an open finding. |
+
+A scan fails when it has a critical or high open finding. A
+`secrets_scan` also fails on any open result that can be a detected
+secret, whatever its level: every result except those whose `kind` is
+`pass`, `notApplicable` or `informational`, which SARIF 2.1.0 §3.27.9
+defines as no problem found. Its counts keep the level the scanner
+reported. Metadata keys appear only when their condition occurs, so a
+plain run produces the same record as before.
+
+The parser does not apply `ruleConfigurationOverrides`, does not fetch
+external property files, and does not open the URIs a result points to.
+
+Tests run these rules against output captured from real tools: Semgrep,
+Gitleaks, KICS, Checkov and tfsec SARIF, Trivy JSON and pytest JUnit. Each
+capture sits in `tests/fixtures/real/<tool>/` with a README that records
+the tool version and the command. CodeQL, Grype, OSV-Scanner, Terrascan
+and ZAP output have no capture there yet.
