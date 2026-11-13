@@ -432,4 +432,6 @@
       }
     }
   };
+  // main.js runs before this script, so apply the motion state it has set.
+  window.__hero3D.setMotion(!reducedMotion());
 })();
